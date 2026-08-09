@@ -1,6 +1,9 @@
 import os
 import asyncio
 import contextlib
+import json
+import uuid
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
@@ -12,6 +15,20 @@ app = FastAPI()
 MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 
 
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def log_event(session_id, event, **data):
+    record = {
+        "timestamp": now(),
+        "session_id": session_id,
+        "event": event,
+        **data,
+    }
+    print("EVENT", json.dumps(record, ensure_ascii=False), flush=True)
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -21,54 +38,81 @@ async def health():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
 
+    session_id = str(uuid.uuid4())
+
+    log_event(session_id, "session_started")
+
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    audio_in_bytes = 0
+    audio_out_bytes = 0
 
     try:
         async with client.aio.live.connect(
             model=MODEL,
             config=types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
+                input_audio_transcription=types.AudioTranscriptionConfig(),
+                output_audio_transcription=types.AudioTranscriptionConfig(),
             ),
         ) as session:
 
             await websocket.send_json({
-                "type": "session_started"
+                "type": "session_started",
+                "session_id": session_id,
             })
 
             async def client_to_gemini():
+                nonlocal audio_in_bytes
+
                 try:
                     while True:
                         message = await websocket.receive()
 
                         if message["type"] == "websocket.disconnect":
-                            print("Client disconnected")
+                            log_event(session_id, "client_disconnected")
                             break
 
                         if message.get("bytes"):
+                            data = message["bytes"]
+                            audio_in_bytes += len(data)
+
                             await session.send_realtime_input(
                                 audio=types.Blob(
-                                    data=message["bytes"],
+                                    data=data,
                                     mime_type="audio/pcm;rate=16000",
                                 )
                             )
 
                         elif message.get("text"):
                             control = message["text"]
+
+                            log_event(
+                                session_id,
+                                "control",
+                                value=control,
+                            )
+
                             if control == "stop":
                                 break
+
                             elif control == "ping":
                                 await websocket.send_json({
                                     "type": "pong"
                                 })
 
                 except WebSocketDisconnect:
-                    print("Client disconnected")
+                    log_event(session_id, "client_disconnected")
 
                 except asyncio.CancelledError:
                     raise
 
                 except Exception as e:
-                    print("CLIENT ERROR:", repr(e))
+                    log_event(
+                        session_id,
+                        "client_error",
+                        error=repr(e),
+                    )
 
                     with contextlib.suppress(Exception):
                         await websocket.send_json({
@@ -78,10 +122,15 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
 
                 finally:
-                    print("Client → Gemini task ended")
-
+                    log_event(
+                        session_id,
+                        "audio_in_summary",
+                        bytes=audio_in_bytes,
+                    )
 
             async def gemini_to_client():
+                nonlocal audio_out_bytes
+
                 try:
                     while True:
                         async for response in session.receive():
@@ -90,9 +139,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             if response.go_away is not None:
                                 time_left = response.go_away.time_left
 
-                                print(
-                                    "Gemini GoAway:",
-                                    time_left,
+                                log_event(
+                                    session_id,
+                                    "go_away",
+                                    time_left=str(time_left),
                                 )
 
                                 await websocket.send_json({
@@ -101,16 +151,17 @@ async def websocket_endpoint(websocket: WebSocket):
                                     "time_left": str(time_left),
                                 })
 
-                            # Session resumption information
+                            # Session resumption
                             if response.session_resumption_update:
                                 update = response.session_resumption_update
 
                                 if update.resumable and update.new_handle:
-                                    print(
-                                        "Received session resumption handle"
+                                    log_event(
+                                        session_id,
+                                        "session_resumption",
+                                        handle_received=True,
                                     )
 
-                                    # We will persist this later.
                                     await websocket.send_json({
                                         "type": "session_resumption",
                                         "handle": update.new_handle,
@@ -118,60 +169,95 @@ async def websocket_endpoint(websocket: WebSocket):
 
                             content = response.server_content
 
-                            if content:
+                            if not content:
+                                continue
 
-                                # User transcription
-                                if content.input_transcription:
-                                    text = content.input_transcription.text
+                            # User transcription
+                            if content.input_transcription:
+                                text = content.input_transcription.text
 
-                                    if text:
-                                        await websocket.send_json({
-                                            "type": "user_transcript",
-                                            "text": text,
-                                        })
+                                if text:
+                                    log_event(
+                                        session_id,
+                                        "user_transcript",
+                                        text=text,
+                                    )
 
-                                # Model transcription
-                                if content.output_transcription:
-                                    text = content.output_transcription.text
-
-                                    if text:
-                                        await websocket.send_json({
-                                            "type": "assistant_transcript",
-                                            "text": text,
-                                        })
-
-                                # Model audio
-                                if content.model_turn:
-                                    for part in content.model_turn.parts:
-
-                                        if part.inline_data:
-                                            await websocket.send_bytes(
-                                                part.inline_data.data
-                                            )
-
-                                # Generation completed
-                                if content.generation_complete:
                                     await websocket.send_json({
-                                        "type": "response_finished"
+                                        "type": "user_transcript",
+                                        "text": text,
                                     })
 
-                                # Complete conversational turn
-                                if content.turn_complete:
+                            # Model transcription
+                            if content.output_transcription:
+                                text = content.output_transcription.text
+
+                                if text:
+                                    log_event(
+                                        session_id,
+                                        "assistant_transcript",
+                                        text=text,
+                                    )
+
                                     await websocket.send_json({
-                                        "type": "turn_complete"
+                                        "type": "assistant_transcript",
+                                        "text": text,
                                     })
 
-                                # User interrupted the model
-                                if content.interrupted:
-                                    await websocket.send_json({
-                                        "type": "interrupted"
-                                    })
+                            # Model audio
+                            if content.model_turn:
+                                for part in content.model_turn.parts:
+
+                                    if part.inline_data:
+                                        data = part.inline_data.data
+                                        audio_out_bytes += len(data)
+
+                                        await websocket.send_bytes(data)
+
+                            # Generation completed
+                            if content.generation_complete:
+                                log_event(
+                                    session_id,
+                                    "generation_complete",
+                                )
+
+                                await websocket.send_json({
+                                    "type": "response_finished"
+                                })
+
+                            # Conversational turn completed
+                            if content.turn_complete:
+                                log_event(
+                                    session_id,
+                                    "turn_complete",
+                                    audio_in_bytes=audio_in_bytes,
+                                    audio_out_bytes=audio_out_bytes,
+                                )
+
+                                await websocket.send_json({
+                                    "type": "turn_complete"
+                                })
+
+                            # User interrupted model
+                            if content.interrupted:
+                                log_event(
+                                    session_id,
+                                    "interrupted",
+                                )
+
+                                await websocket.send_json({
+                                    "type": "interrupted"
+                                })
 
                 except asyncio.CancelledError:
                     raise
 
                 except Exception as e:
-                    print("GEMINI ERROR:", repr(e))
+                    log_event(
+                        session_id,
+                        "gemini_error",
+                        error=repr(e),
+                    )
 
                     with contextlib.suppress(Exception):
                         await websocket.send_json({
@@ -181,8 +267,11 @@ async def websocket_endpoint(websocket: WebSocket):
                         })
 
                 finally:
-                    print("Gemini → Client task ended")
-
+                    log_event(
+                        session_id,
+                        "audio_out_summary",
+                        bytes=audio_out_bytes,
+                    )
 
             client_task = asyncio.create_task(
                 client_to_gemini()
@@ -210,10 +299,19 @@ async def websocket_endpoint(websocket: WebSocket):
                 )
 
     except WebSocketDisconnect:
-        print("WebSocket disconnected")
+        log_event(session_id, "websocket_disconnected")
 
     except Exception as e:
-        print("SESSION ERROR:", repr(e))
+        log_event(
+            session_id,
+            "session_error",
+            error=repr(e),
+        )
 
     finally:
-        print("WebSocket session ended")
+        log_event(
+            session_id,
+            "session_ended",
+            audio_in_bytes=audio_in_bytes,
+            audio_out_bytes=audio_out_bytes,
+        )
