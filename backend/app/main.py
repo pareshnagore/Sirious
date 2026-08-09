@@ -65,45 +65,66 @@ async def websocket_endpoint(websocket: WebSocket):
     ) as session:
 
         async def client_to_gemini():
-            while True:
-                message = await websocket.receive()
+            try:
+                while True:
+                    message = await websocket.receive()
 
-                if message.get("bytes"):
-                    await session.send_realtime_input(
-                        audio={
-                            "data": message["bytes"],
-                            "mime_type": "audio/pcm;rate=16000",
-                        }
-                    )
-
-                elif message.get("text"):
-                    if message["text"] == "turn_complete":
+                    if message.get("bytes"):
+                        print("Received audio:", len(message["bytes"]))
                         await session.send_realtime_input(
-                            audio_stream_end=True
+                            audio={
+                                "data": message["bytes"],
+                                "mime_type": "audio/pcm;rate=16000",
+                            }
                         )
-                        await session.send_client_content(
-                            turns={
-                                "role": "user",
-                                "parts": [
-                                    {"text": "Please respond to what I just said."}
-                                ],
-                            },
-                            turn_complete=True,
-                        )
-                    elif message["text"] == "stop":
-                        break
+                    elif message.get("text"):
+                        print("Control:", message["text"])
+                        if message["text"] == "turn_complete":
+                            await session.send_realtime_input(
+                                audio_stream_end=True
+                            )
+                            await session.send_client_content(
+                                turns={
+                                    "role": "user",
+                                    "parts": [
+                                        {"text": "Please respond to what I just said."}
+                                    ],
+                                },
+                                turn_complete=True,
+                            )
+                        elif message["text"] == "stop":
+                            break
+            except Exception as e:
+                print("CLIENT ERROR:", repr(e))
+                raise
+            finally:
+                print("Client send task ended")
 
         async def gemini_to_client():
-            async for response in session.receive():
-                if (
-                    response.server_content
-                    and response.server_content.model_turn
-                ):
-                    for part in response.server_content.model_turn.parts:
-                        if part.inline_data:
-                            await websocket.send_bytes(
-                                part.inline_data.data
-                            )
+            try:
+                async for response in session.receive():
+                    print("Gemini response received")
+
+                    if (
+                        response.server_content
+                        and response.server_content.model_turn
+                    ):
+                        for part in response.server_content.model_turn.parts:
+                            if part.inline_data:
+                                print(
+                                    "Sending audio:",
+                                    len(part.inline_data.data),
+                                    "bytes",
+                                )
+                                await websocket.send_bytes(
+                                    part.inline_data.data
+                                )
+
+            except Exception as e:
+                print("GEMINI ERROR:", repr(e))
+                raise
+            finally:
+                print("Gemini receive task ended")
 
         client_task = asyncio.create_task(client_to_gemini())
         gemini_task = asyncio.create_task(gemini_to_client())
