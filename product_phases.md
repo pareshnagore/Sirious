@@ -59,12 +59,33 @@ Product phases span multiple layers. A single product phase may complete parts o
 ✅ Turn detection & Gemini barge-in detection
 ✅ Structured server logging & turn summaries
 🟡 Session resumption (detected, not automated)
-❌ Production mobile client
+🟡 Flutter mobile client builds & runs on device (Phase 1 in progress)
 ❌ Persistent storage
 ❌ Memory, tools, multi-speaker, vision
 ```
 
 **Active focus:** Phase 1 — real mobile client with proper audio architecture.
+
+### Phase 1 progress (17 Aug 2026)
+
+```text
+✅ Flutter Android client builds (debug APK) & installs on physical device (SM E346B, Android 16)
+✅ WebSocket v1 client (binary audio + JSON events) matching backend/docs/websocket_protocol.md
+✅ Mic capture (16 kHz PCM) → send; receive → playback queue → speaker; event handler
+✅ Client state machine IDLE→CONNECTING→LISTENING⇄RESPONDING/PLAYING
+✅ Playback cancellation on `interrupted` (clear queue + flush)
+✅ Transcript fragments aggregated per turn (not word-by-word)
+✅ Basic session UX: connect, listening indicator, end session
+✅ Latency timestamps (T0–T3) shown in UI
+✅ FIXED: no audio on follow-up sessions (flutter_pcm_sound _needsStart not reset by release+setup;
+  keep engine warm across sessions, feed via direct drain)
+✅ FIXED: transcript text was persisting across sessions (now cleared at session start)
+🟡 Barge-in latency measured on device (target ~200–500 ms)
+🟡 App survives brief network blips without crashing
+🟡 Full "smooth voice experience" acceptance on device
+❌ Release APK (signed); currently debug
+❌ Upstream protocol/docs re-verification as needed
+```
 
 ---
 
