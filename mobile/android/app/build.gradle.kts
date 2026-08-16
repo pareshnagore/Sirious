@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.sirious.sirious"
-    compileSdk = 36
+    compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
