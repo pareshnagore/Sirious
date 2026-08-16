@@ -49,6 +49,7 @@ class SiriousSessionController extends ChangeNotifier {
 
     _errorMessage = null;
     _sessionId = null;
+    _turns.clear();
     _currentUserText = '';
     _currentAssistantText = '';
     _currentTurnStartedAt = null;
@@ -91,7 +92,10 @@ class SiriousSessionController extends ChangeNotifier {
 
     await _audioCapture.stop();
     await _webSocketClient.disconnect();
-    await _audioPlayback.dispose();
+    // Keep the native audio engine warm across sessions (only clear its queues).
+    // Calling dispose() here tears down playback, and the plugin does not reset
+    // its _needsStart flag on re-setup — the next session would have no audio.
+    await _audioPlayback.flush();
 
     _sessionId = null;
     _currentUserText = '';
