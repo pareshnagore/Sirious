@@ -29,9 +29,11 @@ async def microphone(ws, stop_event):
         data = indata.copy().tobytes()
 
         try:
-            loop.call_soon_threadsafe(queue.put_nowait, data)
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                data,
+            )
         except RuntimeError:
-            # Event loop has already shut down.
             pass
 
     with sd.InputStream(
@@ -43,7 +45,10 @@ async def microphone(ws, stop_event):
     ):
         while not stop_event.is_set():
             try:
-                data = await asyncio.wait_for(queue.get(), timeout=0.5)
+                data = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=0.5,
+                )
             except asyncio.TimeoutError:
                 continue
 
@@ -100,27 +105,20 @@ async def main():
             mic_task = asyncio.create_task(
                 microphone(ws, stop_event)
             )
+
             speaker_task = asyncio.create_task(
                 speaker(ws, stop_event)
             )
 
             try:
-                # Whichever task finishes first ends the session.
-                done, pending = await asyncio.wait(
-                    [mic_task, speaker_task],
-                    return_when=asyncio.FIRST_COMPLETED,
+                await asyncio.gather(
+                    mic_task,
+                    speaker_task,
                 )
-
-                # Surface unexpected exceptions from the completed task.
-                for task in done:
-                    exception = task.exception()
-                    if exception:
-                        raise exception
 
             finally:
                 stop_event.set()
 
-                # Stop both tasks cleanly.
                 for task in (mic_task, speaker_task):
                     if not task.done():
                         task.cancel()
@@ -138,10 +136,14 @@ async def main():
         raise
 
     except Exception as e:
-        print(f"\nClient error: {type(e).__name__}: {e}")
+        print(
+            f"\nClient error: "
+            f"{type(e).__name__}: {e}"
+        )
 
 
 try:
     asyncio.run(main())
+
 except KeyboardInterrupt:
     print("\nStopped.")
