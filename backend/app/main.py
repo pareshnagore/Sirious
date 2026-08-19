@@ -154,6 +154,19 @@ async def websocket_endpoint(websocket: WebSocket):
             config=types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
 
+                # Pin the assistant's OUTPUT language. Native-audio models
+                # cannot be hard-locked via language_code (unsupported), and
+                # Gemini's automatic speech-language detection is unreliable
+                # (it sometimes mishears English as Hindi/Malayalam/etc and
+                # answers back in that language). A clear system instruction
+                # steers the response to always be English regardless of what
+                # language the input is transcribed/interpreted as.
+                system_instruction=(
+                    "You are Sirious, a helpful and concise voice assistant. "
+                    "ALWAYS respond in English, no matter what language the "
+                    "user speaks or is detected as speaking."
+                ),
+
                 input_audio_transcription=(
                     types.AudioTranscriptionConfig()
                 ),
