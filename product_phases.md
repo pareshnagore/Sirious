@@ -87,9 +87,52 @@ Product phases span multiple layers. A single product phase may complete parts o
   (airplane-mode toggle: Listening → Reconnecting → Listening, transcript preserved)
 🟡 Barge-in latency measured on device (target ~200–500 ms)
 🟡 Full "smooth voice experience" acceptance on device
-❌ Release APK (signed); currently debug
+✅ Release APK (signed) — built & verified on 20 Aug 2026 (see "Android build/keystore" below)
 ❌ Upstream protocol/docs re-verification as needed
 ```
+
+### Android build toolchain + keystore (20 Aug 2026)
+
+> **For other agents/PCs:** before any `flutter build` on a fresh machine, read this. The
+> project **cannot** be built with the default toolchain of an old Flutter — it needs the
+> versions below. If a build fails, check these first.
+
+- **Flutter SDK ≥ 3.47** (Dart ≥ 3.11). Older Flutter (e.g. 3.35) fails `pub get` because
+  `path_provider` needs Dart ≥ 3.10.
+- **Gradle 9.3.1**, **AGP 9.1.0**, **Kotlin 2.4.0** — pinned in
+  `mobile/android/gradle/wrapper/gradle-wrapper.properties` and
+  `mobile/android/settings.gradle.kts`. These are Flutter 3.47's *tested defaults* —
+  don't downgrade them. They're needed because Flutter uses Android Studio's bundled JBR
+  (Java 25), and old Gradle (8.14) cannot run on Java 25.
+- **No JDK install needed** — Java 25 comes from Android Studio's bundled JBR
+  (`/Applications/Android Studio.app/Contents/jbr`). Gradle 9.3.1 supports it.
+- **Android build-tools 37.0.0** must be installed (`sdkmanager "build-tools;37.0.0"`)
+  — the build needs `platforms/android-37` + build-tools 37 for `compileSdk = 37`.
+
+**`flutter_pcm_sound` compileSdk patch (IMPORTANT, easy to miss):**
+- `flutter_pcm_sound` 3.3.3 (latest) ships `compileSdkVersion 33`, but its transitive
+  AndroidX deps require android-34+. Build fails with
+  `:flutter_pcm_sound:checkDebugAarMetadata` / `CheckAarMetadataWorkAction`.
+- **Fix:** edit `~/.pub-cache/hosted/pub.dev/flutter_pcm_sound-3.3.3/android/build.gradle`
+  → `compileSdkVersion 37`. ⚠️ This lives in the pub cache, **not** the repo — a fresh
+  `flutter pub get` reverts it. Vendor the plugin or ask the maintainer before a real
+  distribution.
+
+**Signing / keystore (do NOT commit to this repo — it is PUBLIC):**
+- Release keystore: `mobile/android/app/upload-keystore.jks`
+  (alias `sirious`). Passwords: `mobile/android/key.properties`.
+- **Both are gitignored** and must stay out of the public GitHub repo (see below).
+- `mobile/android/app/build.gradle.kts` loads them, falls back to debug signing
+  if `key.properties` is absent (so a fresh clone still builds).
+- **Back these up off-machine** — losing the keystore means you can never update the app
+  under `com.sirious.sirious`.
+
+**Remote push from this machine (important):**
+- The local agent (Claude Code) does **not** push to GitHub — the user has a
+  **fine-grained Personal Access Token** for `git push` and their credentials are not
+  available to the agent. Agents commit locally; **the user pushes** (or a token-based
+  `git push` via `gh`/the user).
+- The GitHub repo `pareshnagore/Sirious` is **public**.
 
 ---
 
