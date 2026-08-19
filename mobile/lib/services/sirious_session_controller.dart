@@ -50,6 +50,25 @@ class SiriousSessionController extends ChangeNotifier {
   final List<String> _bargeInLog = <String>[];
   List<String> get bargeInLog => List.unmodifiable(_bargeInLog);
 
+  // ── Network-blip resilience ─────────────────────────────────────────────
+  // On a brief disconnect or a stalled socket we auto-reconnect to a FRESH
+  // server+Gemini session (protocol v1 has no automated resumption). Any
+  // on-device transcript already committed is preserved; the mid-utterance
+  // partial turn is committed before reconnect so nothing on screen is lost.
+  bool _allowReconnect = false; // true only while the user wants a live session
+  int _reconnectAttempts = 0;
+  static const int _maxReconnectAttempts = 5;
+  static const int _keepaliveIntervalMs = 5000; // ping cadence
+  static const int _stallTimeoutMs = 15000; // no server data → treat as dead
+  Timer? _reconnectTimer;
+  Timer? _keepaliveTimer;
+
+  /// Backoff delay for the Nth retry (1s, 2s, 4s, … capped at 8s).
+  Duration _reconnectDelay() {
+    final exp = math.min(_reconnectAttempts, 3); // 2^3 = 8s cap
+    return Duration(milliseconds: 1000 * (1 << exp));
+  }
+
   static String _clock(DateTime dt) {
     String p(int v) => v.toString().padLeft(2, '0');
     final ms = dt.millisecond.toString().padLeft(3, '0');
@@ -206,14 +225,18 @@ class SiriousSessionController extends ChangeNotifier {
     latency.sessionConnectedAt = null;
     latency.firstMicChunkAt = null;
     latency.resetForTurn();
+    _allowReconnect = true;
+    _reconnectAttempts = 0;
     _setPhase(SessionPhase.connecting);
 
     try {
       await _audioPlayback.init();
       await _webSocketClient.connect();
       await _audioCapture.start();
+      _startKeepalive();
       _setPhase(SessionPhase.listening);
     } catch (error) {
+      _allowReconnect = false;
       _errorMessage = error.toString();
       _setPhase(SessionPhase.error);
       await _cleanupSession(endPhase: SessionPhase.error);
@@ -230,6 +253,10 @@ class SiriousSessionController extends ChangeNotifier {
   }
 
   Future<void> _cleanupSession({required SessionPhase endPhase}) async {
+    _allowReconnect = false;
+    _stopKeepalive();
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
     _commitCurrentTurn(interrupted: _phase == SessionPhase.interrupting);
 
     try {
@@ -323,6 +350,20 @@ class SiriousSessionController extends ChangeNotifier {
       case 'session_started':
         _sessionId = event['session_id'] as String?;
         latency.sessionConnectedAt = DateTime.now();
+        if (_phase == SessionPhase.reconnecting) {
+          // Reconnect succeeded → resume listening on the fresh session.
+          final recovered = _reconnectAttempts;
+          _reconnectAttempts = 0;
+          _pushBargeInLine(
+            'Reconnected after $recovered retr${recovered == 1 ? 'y' : 'ies'}',
+          );
+          unawaited(
+            _logToFile(
+              'RECONNECT ok attempts=$recovered new_session=$_sessionId',
+            ),
+          );
+          _setPhase(SessionPhase.listening);
+        }
         break;
 
       case 'user_transcript':
@@ -400,17 +441,124 @@ class SiriousSessionController extends ChangeNotifier {
   }
 
   void _onSocketDone() {
-    if (_phase.isActive) {
+    if (_phase.isActive && _allowReconnect) {
+      // Network blip (server closed / lost) → reconnect instead of ending.
+      _scheduleReconnect();
+    } else if (_phase.isActive) {
       _errorMessage ??= 'Connection closed';
       unawaited(_cleanupSession(endPhase: SessionPhase.idle));
     }
   }
 
   void _onSocketError(Object error) {
+    if (_phase.isActive && _allowReconnect) {
+      unawaited(_logToFile('RECONNECT socket_error $_errorMessage'));
+      _scheduleReconnect();
+      return;
+    }
     _errorMessage = error.toString();
     _setPhase(SessionPhase.error);
     notifyListeners();
     unawaited(_cleanupSession(endPhase: SessionPhase.error));
+  }
+
+  // ── Network-blip reconnect ──────────────────────────────────────────────
+
+  /// Commit the in-flight partial turn (so nothing on screen is lost), stop
+  /// playback, then schedule the next connect attempt with backoff.
+  void _scheduleReconnect() {
+    if (!_allowReconnect) {
+      return;
+    }
+    if (_reconnectAttempts >= _maxReconnectAttempts) {
+      _errorMessage =
+          'Connection lost. Could not reconnect after '
+          '$_maxReconnectAttempts attempts.';
+      _setPhase(SessionPhase.error);
+      notifyListeners();
+      unawaited(_cleanupSession(endPhase: SessionPhase.error));
+      return;
+    }
+
+    _commitCurrentTurn(interrupted: false);
+    _endOnsetWindow();
+    try {
+      _audioPlayback.flush();
+    } catch (_) {}
+
+    _setPhase(SessionPhase.reconnecting);
+    _reconnectAttempts++;
+    final delay = _reconnectDelay();
+    unawaited(
+      _logToFile(
+        'RECONNECT schedule attempt=$_reconnectAttempts delay_ms=${delay.inMilliseconds}',
+      ),
+    );
+    _pushBargeInLine('Blip — reconnecting (attempt $_reconnectAttempts)…');
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(delay, () {
+      _reconnectTimer = null;
+      unawaited(_tryReconnect());
+    });
+  }
+
+  Future<void> _tryReconnect() async {
+    try {
+      await _webSocketClient.connect();
+      // On success we stay in `reconnecting` until `session_started` flips us
+      // to `listening`. If this attempt drops again, onDone schedules the next.
+    } catch (error) {
+      unawaited(_logToFile('RECONNECT attempt failed: $error'));
+      _scheduleReconnect();
+    }
+  }
+
+  // ── Keepalive / stall watchdog ──────────────────────────────────────────
+  // A "blip" can also silently stall the socket (still connected, no data).
+  // We ping periodically and salvage if the server stops sending entirely.
+
+  void _startKeepalive() {
+    _keepaliveTimer?.cancel();
+    _keepaliveTimer = Timer.periodic(
+      const Duration(milliseconds: _keepaliveIntervalMs),
+      (_) => _keepaliveTick(),
+    );
+  }
+
+  void _stopKeepalive() {
+    _keepaliveTimer?.cancel();
+    _keepaliveTimer = null;
+  }
+
+  void _keepaliveTick() {
+    if (!_allowReconnect) {
+      return;
+    }
+    if (_webSocketClient.isConnected) {
+      try {
+        _webSocketClient.sendPing();
+      } catch (_) {}
+    }
+
+    final sinceData = DateTime.now().difference(
+      _webSocketClient.lastReceivedAt,
+    );
+    final phase = _phase;
+    final isLivePhase =
+        phase == SessionPhase.listening ||
+        phase == SessionPhase.responding ||
+        phase == SessionPhase.playing;
+    if (isLivePhase && sinceData.inMilliseconds > _stallTimeoutMs) {
+      unawaited(
+        _logToFile(
+          'RECONNECT stall detected idle_ms=${sinceData.inMilliseconds}',
+        ),
+      );
+      // Tear down the stale socket — its cancelled subscription won't fire
+      // onDone, so schedule the reconnect explicitly.
+      unawaited(_webSocketClient.disconnect());
+      _scheduleReconnect();
+    }
   }
 
   void _endOnsetWindow() {

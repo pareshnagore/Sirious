@@ -3,11 +3,7 @@ import 'package:flutter/material.dart';
 import '../../models/session_phase.dart';
 
 class StatusIndicator extends StatelessWidget {
-  const StatusIndicator({
-    super.key,
-    required this.phase,
-    this.sessionId,
-  });
+  const StatusIndicator({super.key, required this.phase, this.sessionId});
 
   final SessionPhase phase;
   final String? sessionId;
@@ -17,6 +13,7 @@ class StatusIndicator extends StatelessWidget {
       case SessionPhase.listening:
         return Colors.green;
       case SessionPhase.connecting:
+      case SessionPhase.reconnecting:
       case SessionPhase.responding:
       case SessionPhase.playing:
         return Colors.blue;
@@ -42,16 +39,10 @@ class StatusIndicator extends StatelessWidget {
             Container(
               width: 12,
               height: 12,
-              decoration: BoxDecoration(
-                color: color,
-                shape: BoxShape.circle,
-              ),
+              decoration: BoxDecoration(color: color, shape: BoxShape.circle),
             ),
             const SizedBox(width: 8),
-            Text(
-              phase.label,
-              style: Theme.of(context).textTheme.titleMedium,
-            ),
+            Text(phase.label, style: Theme.of(context).textTheme.titleMedium),
           ],
         ),
         if (sessionId != null) ...[

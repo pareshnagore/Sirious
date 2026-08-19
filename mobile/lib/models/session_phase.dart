@@ -1,6 +1,7 @@
 enum SessionPhase {
   idle,
   connecting,
+  reconnecting,
   listening,
   responding,
   playing,
@@ -16,6 +17,8 @@ extension SessionPhaseLabel on SessionPhase {
         return 'Idle';
       case SessionPhase.connecting:
         return 'Connecting…';
+      case SessionPhase.reconnecting:
+        return 'Reconnecting…';
       case SessionPhase.listening:
         return 'Listening';
       case SessionPhase.responding:
@@ -34,6 +37,7 @@ extension SessionPhaseLabel on SessionPhase {
   bool get isActive {
     switch (this) {
       case SessionPhase.connecting:
+      case SessionPhase.reconnecting:
       case SessionPhase.listening:
       case SessionPhase.responding:
       case SessionPhase.playing:

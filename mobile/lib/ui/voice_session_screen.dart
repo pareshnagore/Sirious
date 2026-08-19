@@ -66,6 +66,24 @@ class _VoiceSessionScreenState extends State<VoiceSessionScreen> {
                   style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
+            if (_controller.phase == SessionPhase.reconnecting)
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    'Network blip — reconnecting automatically…',
+                    style: Theme.of(context).textTheme.bodyMedium,
+                  ),
+                ),
+              ),
             Expanded(
               child: TranscriptPanel(
                 turns: _controller.turns,

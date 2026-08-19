@@ -29,6 +29,12 @@ class WebSocketClient {
   WebSocketChannel? _channel;
   StreamSubscription<dynamic>? _subscription;
 
+  /// Wall-clock of the last frame received from the server (JSON or binary).
+  /// Fed to the controller's keepalive watchdog so a socket that silently
+  /// stalls (no close, no data) can be detected and reconnected.
+  DateTime _lastReceivedAt = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime get lastReceivedAt => _lastReceivedAt;
+
   bool get isConnected => _channel != null;
 
   Future<void> connect() async {
@@ -36,6 +42,7 @@ class WebSocketClient {
 
     final channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
     _channel = channel;
+    _lastReceivedAt = DateTime.now();
 
     _subscription = channel.stream.listen(
       _handleMessage,
@@ -51,6 +58,7 @@ class WebSocketClient {
   }
 
   void _handleMessage(dynamic message) {
+    _lastReceivedAt = DateTime.now();
     if (message is List<int>) {
       onBinaryData(Uint8List.fromList(message));
       return;

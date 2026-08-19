@@ -80,8 +80,12 @@ Product phases span multiple layers. A single product phase may complete parts o
 ✅ FIXED: no audio on follow-up sessions (flutter_pcm_sound _needsStart not reset by release+setup;
   keep engine warm across sessions, feed via direct drain)
 ✅ FIXED: transcript text was persisting across sessions (now cleared at session start)
+✅ FIXED (19 Aug): app survives brief network blips — auto-reconnects to a fresh
+  server/Gemini session (client-side, exponential backoff 1s→8s, 5 attempts) and
+  resumes Listening; mid-utterance partial turn committed so nothing is lost;
+  keepalive ping + stall watchdog catches sockets that silently stop; verified live
+  (airplane-mode toggle: Listening → Reconnecting → Listening, transcript preserved)
 🟡 Barge-in latency measured on device (target ~200–500 ms)
-🟡 App survives brief network blips without crashing
 🟡 Full "smooth voice experience" acceptance on device
 ❌ Release APK (signed); currently debug
 ❌ Upstream protocol/docs re-verification as needed
