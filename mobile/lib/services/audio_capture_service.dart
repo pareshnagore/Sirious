@@ -35,6 +35,13 @@ class AudioCaptureService {
         encoder: AudioEncoder.pcm16bits,
         sampleRate: AppConfig.inputSampleRate,
         numChannels: AppConfig.inputChannels,
+        // Enable on-device acoustic echo cancellation / noise suppression so
+        // the mic does not feed Sirious's own playout back to the server.
+        // Without this, earpiece/speaker audio bleeds into the capture, which
+        // causes audible echo AND confuses Gemini's barge-in detection.
+        echoCancel: true,
+        noiseSuppress: true,
+        autoGain: true,
       ),
     );
 

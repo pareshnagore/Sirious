@@ -1,6 +1,9 @@
 import 'dart:async';
+import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../models/latency_metrics.dart';
 import '../models/session_phase.dart';
@@ -41,6 +44,153 @@ class SiriousSessionController extends ChangeNotifier {
   String get currentAssistantText => _currentAssistantText;
   List<TranscriptTurn> get turns => List.unmodifiable(_turns);
   bool get isSessionActive => _phase.isActive;
+
+  /// Persistent, on-screen barge-in measurement log (newest first). Rendered
+  /// directly in the UI so results are visible without files/logcat/screenshots.
+  final List<String> _bargeInLog = <String>[];
+  List<String> get bargeInLog => List.unmodifiable(_bargeInLog);
+
+  static String _clock(DateTime dt) {
+    String p(int v) => v.toString().padLeft(2, '0');
+    final ms = dt.millisecond.toString().padLeft(3, '0');
+    return '${p(dt.hour)}:${p(dt.minute)}:${p(dt.second)}.$ms';
+  }
+
+  /// Barge-in onset is detected relative to the ambient noise floor so it
+  /// adapts to the device's real mic gain (AEC/AGC are device-dependent).
+  /// Onset fires when: rms > max(noiseFloor * riseFactor, hardFloor).
+  /// Speck chunks far above silence are excluded from the floor so speech
+  /// never inflates the baseline (which would suppress detection).
+  static const double _onsetHardFloor = 250.0;
+  static const double _onsetRiseFactor = 4.0;
+  static const int _noiseWindowChunks = 20; // ~2s at 100ms chunks
+
+  final List<double> _recentRms = <double>[];
+  double _onsetNoiseFloor = 0;
+  double _windowPeakRms = 0; // loudest chunk in the CURRENT playback window
+  bool _interruptionHandled = false; // true once this turn's barge-in ran
+
+  double _rms(Uint8List pcm) {
+    final sampleCount = pcm.length ~/ 2;
+    if (sampleCount <= 0) {
+      return 0;
+    }
+    final bd = ByteData.sublistView(pcm);
+    var sumSq = 0.0;
+    for (var i = 0; i < sampleCount; i++) {
+      final s = bd.getInt16(i * 2, Endian.little).toDouble();
+      sumSq += s * s;
+    }
+    return math.sqrt(sumSq / sampleCount);
+  }
+
+  /// Durable, pullable log on the device (read via `adb shell run-as
+  /// com.sirious.sirious cat files/app_flutter/sirious_bargein.log` for a
+  /// debug build). The on-screen summary only shows the LAST measurement
+  /// briefly, which is unreliable to capture — this file is the source of
+  /// truth for barge-in. `getApplicationDocumentsDirectory()` is the canonical
+  /// writable app dir (Directory.systemTemp is not writable on Android).
+  Future<void> _logToFile(String message) async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final file = File('${dir.path}/sirious_bargein.log');
+      await file.writeAsString(
+        '${DateTime.now().toIso8601String()} $message\n',
+        mode: FileMode.append,
+      );
+    } catch (e) {
+      debugPrint('bargein log write failed: $e');
+    }
+  }
+
+  void _logBargeIn() {
+    final onset = latency.bargeInOnsetAt;
+    final interrupted = latency.lastInterruptedAt;
+    final stopped = latency.bargeInAudioStoppedAt;
+
+    // Copy live levels into the persisted display fields BEFORE any reset.
+    latency.lastBargeInPeakRms = _windowPeakRms;
+    latency.lastBargeInNoiseFloor = _onsetNoiseFloor;
+
+    if (onset != null && interrupted != null && stopped != null) {
+      final serverMs = interrupted.difference(onset).inMilliseconds;
+      final flushMs = stopped.difference(interrupted).inMilliseconds;
+      final totalMs = stopped.difference(onset).inMilliseconds;
+      latency.lastBargeInServerMs = serverMs;
+      latency.lastBargeInFlushMs = flushMs;
+      latency.lastBargeInTotalMs = totalMs;
+      latency.lastBargeInOnsetMissing = false;
+      debugPrint(
+        'BARGE_IN onset→interrupt(server+net)=${serverMs}ms · '
+        'interrupt→stop(flush)=${flushMs}ms · TOTAL=${totalMs}ms',
+      );
+      unawaited(
+        _logToFile(
+          'BARGE_IN ok onset_ms=$serverMs flush_ms=$flushMs total_ms=$totalMs '
+          'peak_rms=${_windowPeakRms.toStringAsFixed(0)} '
+          'floor_rms=${_onsetNoiseFloor.toStringAsFixed(0)}',
+        ),
+      );
+      _pushBargeInLine(
+        '${_clock(onset)} → ${_clock(stopped)} · $totalMs ms '
+        '(server $serverMs + flush $flushMs)',
+      );
+    } else {
+      latency.lastBargeInTotalMs = null;
+      latency.lastBargeInOnsetMissing = true;
+      debugPrint(
+        'BARGE_IN interrupted; onset missing '
+        '(peakRms=${latency.lastBargeInPeakRms.toStringAsFixed(0)})',
+      );
+      unawaited(
+        _logToFile(
+          'BARGE_IN ONSET_MISSING peak_rms=${_windowPeakRms.toStringAsFixed(0)} '
+          'floor_rms=${_onsetNoiseFloor.toStringAsFixed(0)} '
+          'onset=$onset interrupted=$interrupted stopped=$stopped',
+        ),
+      );
+      _pushBargeInLine(
+        '${_clock(DateTime.now())} · onset missed '
+        '(peak ${_windowPeakRms.toStringAsFixed(0)} '
+        'floor ${_onsetNoiseFloor.toStringAsFixed(0)})',
+      );
+    }
+    notifyListeners();
+  }
+
+  void _pushBargeInLine(String line) {
+    _bargeInLog.insert(0, line);
+    if (_bargeInLog.length > 12) {
+      _bargeInLog.removeLast();
+    }
+  }
+
+  /// Single code path for a barge-in, triggered either by Gemini's explicit
+  /// `interrupted` event OR by a `user_transcript` arriving during playback.
+  /// Runs at most once per turn (guarded by [_interruptionHandled]).
+  Future<void> _handleInterruption(DateTime receivedAt) async {
+    if (_interruptionHandled) {
+      return;
+    }
+    _interruptionHandled = true;
+
+    latency.lastInterruptedAt = receivedAt;
+    _setPhase(SessionPhase.interrupting);
+
+    DateTime? stoppedAt;
+    try {
+      stoppedAt = await _audioPlayback.flush();
+    } catch (error, stackTrace) {
+      debugPrint('Barge-in flush failed: $error\n$stackTrace');
+    }
+    latency.bargeInAudioStoppedAt = stoppedAt ?? DateTime.now();
+
+    _logBargeIn();
+    _endOnsetWindow();
+    _commitCurrentTurn(interrupted: true);
+    _setPhase(SessionPhase.listening);
+    latency.resetForTurn();
+  }
 
   Future<void> startSession() async {
     if (_phase.isActive) {
@@ -107,6 +257,48 @@ class SiriousSessionController extends ChangeNotifier {
   void _onMicChunk(Uint8List chunk) {
     latency.firstMicChunkAt ??= DateTime.now();
 
+    // Barge-in onset: track mic energy while Sirious is talking (including the
+    // brief `interrupting` window so a fast server response can't suppress it).
+    // A single chunk above the adaptive threshold marks the user's onset.
+    if (_phase == SessionPhase.playing ||
+        _phase == SessionPhase.responding ||
+        _phase == SessionPhase.interrupting) {
+      final rms = _rms(chunk);
+      if (rms > _windowPeakRms) {
+        _windowPeakRms = rms;
+      }
+
+      // Update the quiet baseline only with near-silence samples.
+      if (rms < _onsetHardFloor * 2) {
+        _recentRms.add(rms);
+        if (_recentRms.length > _noiseWindowChunks) {
+          _recentRms.removeAt(0);
+        }
+      }
+      var floor = double.infinity;
+      for (final v in _recentRms) {
+        if (v < floor) {
+          floor = v;
+        }
+      }
+      _onsetNoiseFloor = floor.isFinite ? floor : _onsetHardFloor;
+      latency.lastBargeInNoiseFloor = _onsetNoiseFloor;
+
+      final threshold = math.max(
+        _onsetNoiseFloor * _onsetRiseFactor,
+        _onsetHardFloor,
+      );
+      if (latency.bargeInOnsetAt == null && rms > threshold) {
+        latency.bargeInOnsetAt = DateTime.now();
+        unawaited(
+          _logToFile(
+            'ONSET rms=${rms.toStringAsFixed(0)} '
+            'thr=${threshold.toStringAsFixed(0)} floor=${_onsetNoiseFloor.toStringAsFixed(0)}',
+          ),
+        );
+      }
+    }
+
     if (_webSocketClient.isConnected) {
       _webSocketClient.sendAudio(chunk);
     }
@@ -115,16 +307,17 @@ class SiriousSessionController extends ChangeNotifier {
   void _onBinaryData(Uint8List chunk) {
     latency.firstAssistantAudioAt ??= DateTime.now();
 
-    if (_phase == SessionPhase.listening ||
-        _phase == SessionPhase.responding) {
+    if (_phase == SessionPhase.listening || _phase == SessionPhase.responding) {
       _setPhase(SessionPhase.playing);
     }
 
     _audioPlayback.enqueue(chunk);
   }
 
-  void _onJsonEvent(Map<String, dynamic> event) {
+  Future<void> _onJsonEvent(Map<String, dynamic> event) async {
     final type = event['type'] as String?;
+    debugPrint('WS_EVENT: $type');
+    unawaited(_logToFile('EVENT $type ${event['text'] ?? ''}'));
 
     switch (type) {
       case 'session_started':
@@ -143,7 +336,10 @@ class SiriousSessionController extends ChangeNotifier {
         _currentUserText += text;
 
         if (_phase == SessionPhase.playing) {
-          _setPhase(SessionPhase.interrupting);
+          // User is talking while Sirious is playing — that is a barge-in.
+          // Flush + measure immediately; don't wait for a separate
+          // `interrupted` event (Gemini may not always emit one).
+          await _handleInterruption(DateTime.now());
         } else if (_phase == SessionPhase.listening) {
           _setPhase(SessionPhase.responding);
         }
@@ -176,15 +372,11 @@ class SiriousSessionController extends ChangeNotifier {
         break;
 
       case 'interrupted':
-        latency.lastInterruptedAt = DateTime.now();
-        _setPhase(SessionPhase.interrupting);
-        unawaited(_audioPlayback.flush());
-        _commitCurrentTurn(interrupted: true);
-        _setPhase(SessionPhase.listening);
-        latency.resetForTurn();
+        await _handleInterruption(DateTime.now());
         break;
 
       case 'turn_complete':
+        _endOnsetWindow();
         _commitCurrentTurn(interrupted: false);
         _setPhase(SessionPhase.listening);
         latency.resetForTurn();
@@ -219,6 +411,15 @@ class SiriousSessionController extends ChangeNotifier {
     _setPhase(SessionPhase.error);
     notifyListeners();
     unawaited(_cleanupSession(endPhase: SessionPhase.error));
+  }
+
+  void _endOnsetWindow() {
+    // Reset only the LIVE window tracking. Persisted display values
+    // (lastBargeIn*) must survive so the summary keeps the last result.
+    _recentRms.clear();
+    _onsetNoiseFloor = 0;
+    _windowPeakRms = 0;
+    _interruptionHandled = false;
   }
 
   void _commitCurrentTurn({required bool interrupted}) {

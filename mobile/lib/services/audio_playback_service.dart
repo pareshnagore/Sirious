@@ -91,24 +91,32 @@ class AudioPlaybackService {
 
   /// Hard stop: drop queued audio and reset the native player.
   /// Used on barge-in (`interrupted`) and at session end.
-  Future<void> flush() async {
+  /// Returns the wall-clock time when the speaker has actually gone silent
+  /// (after the native player is released), null if not initialized.
+  Future<DateTime?> flush() async {
     if (!_initialized) {
-      return;
+      return null;
     }
 
     _flushing = true;
-    _queue.clear();
+        _queue.clear();
 
-    try {
-      await FlutterPcmSound.release();
-      await _setupOutput();
-      await FlutterPcmSound.setFeedThreshold(
-        AppConfig.outputSampleRate ~/ 10,
-      );
-    } finally {
-      _flushing = false;
-    }
-  }
+        DateTime? stopTime;
+        try {
+          await FlutterPcmSound.release();
+          // The speaker is silent the instant the native engine is released.
+          // Timestamp it HERE — the re-setup below is extra latency, not silence.
+          stopTime = DateTime.now();
+          await _setupOutput();
+          await FlutterPcmSound.setFeedThreshold(
+            AppConfig.outputSampleRate ~/ 10,
+          );
+        } finally {
+          _flushing = false;
+        }
+
+        return stopTime;
+      }
 
   /// App-teardown only. Not called between sessions.
   Future<void> dispose() async {

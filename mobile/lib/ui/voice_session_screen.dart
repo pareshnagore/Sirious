@@ -47,10 +47,7 @@ class _VoiceSessionScreenState extends State<VoiceSessionScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Sirious'),
-        centerTitle: true,
-      ),
+      appBar: AppBar(title: const Text('Sirious'), centerTitle: true),
       body: SafeArea(
         child: Column(
           children: [
@@ -66,9 +63,7 @@ class _VoiceSessionScreenState extends State<VoiceSessionScreen> {
                 padding: const EdgeInsets.symmetric(horizontal: 16),
                 child: Text(
                   _controller.errorMessage!,
-                  style: TextStyle(
-                    color: Theme.of(context).colorScheme.error,
-                  ),
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
                 ),
               ),
             Expanded(
@@ -86,12 +81,42 @@ class _VoiceSessionScreenState extends State<VoiceSessionScreen> {
                 textAlign: TextAlign.center,
               ),
             ),
+            if (_controller.bargeInLog.isNotEmpty)
+              Container(
+                margin: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+                padding: const EdgeInsets.all(8),
+                constraints: const BoxConstraints(maxHeight: 210),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: _controller.bargeInLog.length,
+                  itemBuilder: (context, i) => Text(
+                    _controller.bargeInLog[i],
+                    style: Theme.of(
+                      context,
+                    ).textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
+                  ),
+                ),
+              )
+            else
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                child: Text(
+                  'Barge-in log: none yet — interrupt Sirious MID-sentence to record one.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 11),
+                ),
+              ),
             Padding(
               padding: const EdgeInsets.all(16),
               child: SizedBox(
                 width: double.infinity,
                 child: FilledButton.icon(
-                  onPressed: _controller.phase == SessionPhase.connecting ||
+                  onPressed:
+                      _controller.phase == SessionPhase.connecting ||
                           _controller.phase == SessionPhase.ending
                       ? null
                       : _toggleSession,
