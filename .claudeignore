@@ -1,0 +1,45 @@
+# ----------------------------------------------------
+# 🐍 PYTHON / BACKEND REJECTS
+# ----------------------------------------------------
+backend/.venv/
+backend/*/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.pytest_cache/
+.poetry/
+
+# ----------------------------------------------------
+# 📱 FLUTTER & ANDROID REJECTS
+# ----------------------------------------------------
+mobile/.dart_tool/
+mobile/.idea/
+mobile/.gradle/
+mobile/build/
+mobile/android/app/src/main/res/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/generated_plugin_registrant.dart
+**/*.gradle
+**/*.kts
+**/*.jar
+**/*.bat
+mobile/gradlew
+
+# ----------------------------------------------------
+# 🌐 GLOBAL DEVELOPMENT TRASH
+# ----------------------------------------------------
+.git/
+.claude/
+.env
+.env.*
+**/*.wav
+**/*.mp3
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.svg
+**/node_modules/
+**/dist/
+**/build/
