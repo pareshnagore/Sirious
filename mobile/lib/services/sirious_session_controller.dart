@@ -37,6 +37,12 @@ class SiriousSessionController extends ChangeNotifier {
   final LatencyMetrics latency = LatencyMetrics();
   DateTime? _currentTurnStartedAt;
 
+  /// Stable per-conversation id (protocol v2). Generated once per user session
+  /// and reused across reconnects so the backend can resume the SAME Gemini
+  /// session instead of starting fresh. Cleared when the user ends the
+  /// session, so the next Start begins a genuinely new conversation.
+  String? _clientSessionId;
+
   SessionPhase get phase => _phase;
   String? get sessionId => _sessionId;
   String? get errorMessage => _errorMessage;
@@ -218,6 +224,7 @@ class SiriousSessionController extends ChangeNotifier {
 
     _errorMessage = null;
     _sessionId = null;
+    _clientSessionId ??= _generateClientSessionId();
     _turns.clear();
     _currentUserText = '';
     _currentAssistantText = '';
@@ -231,7 +238,7 @@ class SiriousSessionController extends ChangeNotifier {
 
     try {
       await _audioPlayback.init();
-      await _webSocketClient.connect();
+      await _webSocketClient.connect(clientSessionId: _clientSessionId);
       await _audioCapture.start();
       _startKeepalive();
       _setPhase(SessionPhase.listening);
@@ -275,6 +282,7 @@ class SiriousSessionController extends ChangeNotifier {
     await _audioPlayback.flush();
 
     _sessionId = null;
+    _clientSessionId = null;
     _currentUserText = '';
     _currentAssistantText = '';
     _currentTurnStartedAt = null;
@@ -350,19 +358,29 @@ class SiriousSessionController extends ChangeNotifier {
       case 'session_started':
         _sessionId = event['session_id'] as String?;
         latency.sessionConnectedAt = DateTime.now();
+        final resumed = event['resumed'] == true;
         if (_phase == SessionPhase.reconnecting) {
           // Reconnect succeeded → resume listening on the fresh session.
           final recovered = _reconnectAttempts;
           _reconnectAttempts = 0;
           _pushBargeInLine(
-            'Reconnected after $recovered retr${recovered == 1 ? 'y' : 'ies'}',
+            resumed
+                ? 'Reconnected — Gemini context RESUMED '
+                    '(after $recovered retr${recovered == 1 ? 'y' : 'ies'})'
+                : 'Reconnected after $recovered retr'
+                    '${recovered == 1 ? 'y' : 'ies'} (fresh Gemini context)',
           );
           unawaited(
             _logToFile(
-              'RECONNECT ok attempts=$recovered new_session=$_sessionId',
+              'RECONNECT ok attempts=$recovered new_session=$_sessionId '
+              'resumed=$resumed',
             ),
           );
           _setPhase(SessionPhase.listening);
+        } else {
+          unawaited(
+            _logToFile('SESSION started=$_sessionId resumed=$resumed'),
+          );
         }
         break;
 
@@ -504,13 +522,23 @@ class SiriousSessionController extends ChangeNotifier {
 
   Future<void> _tryReconnect() async {
     try {
-      await _webSocketClient.connect();
+      // Same client_session_id → backend resumes the SAME Gemini session
+      // (model memory intact) when it holds a live resumption handle.
+      await _webSocketClient.connect(clientSessionId: _clientSessionId);
       // On success we stay in `reconnecting` until `session_started` flips us
       // to `listening`. If this attempt drops again, onDone schedules the next.
     } catch (error) {
       unawaited(_logToFile('RECONNECT attempt failed: $error'));
       _scheduleReconnect();
     }
+  }
+
+  /// Stable id for the current conversation, sent on every (re)connect so the
+  /// backend can look up the Gemini resumption handle for continuity.
+  String _generateClientSessionId() {
+    final ts = DateTime.now().millisecondsSinceEpoch.toRadixString(36);
+    final rand = math.Random().nextInt(0x7FFFFFFF).toRadixString(36);
+    return 'cs-$ts-$rand';
   }
 
   // ── Keepalive / stall watchdog ──────────────────────────────────────────

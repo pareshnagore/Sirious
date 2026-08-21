@@ -37,10 +37,22 @@ class WebSocketClient {
 
   bool get isConnected => _channel != null;
 
-  Future<void> connect() async {
+  Future<void> connect({String? clientSessionId}) async {
     await disconnect();
 
-    final channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
+    // Append the stable client_session_id so the backend can resume the same
+    // Gemini session across reconnects (protocol v2). Absent → fresh session.
+    var target = Uri.parse(_wsUrl);
+    if (clientSessionId != null && clientSessionId.isNotEmpty) {
+      target = target.replace(
+        queryParameters: {
+          ...target.queryParameters,
+          'client_session_id': clientSessionId,
+        },
+      );
+    }
+
+    final channel = WebSocketChannel.connect(target);
     _channel = channel;
     _lastReceivedAt = DateTime.now();
 

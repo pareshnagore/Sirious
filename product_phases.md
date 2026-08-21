@@ -268,7 +268,13 @@ Conversations are **saved and searchable**. User can revisit what was said and b
 - Storage backend (Firestore, Cloud SQL, or BigQuery — choose one)
 - Async write path (must not block real-time WebSocket)
 - Simple in-app history list + transcript detail view
-- Server-side session resumption on `go_away` (needed for sessions > ~8 min before this matters in production)
+- ~~Server-side session resumption on `go_away`~~ → **DONE (21 Aug 2026, protocol v2)** —
+  client stable `client_session_id` + backend handle store/resume; verified live:
+  spoke a fact → hard socket drop → reconnected (`resumed=true`) → Gemini still knew the fact.
+  ⚠️ Requires a model that emits resumable handles — current prod model
+  `gemini-2.5-flash-native-audio-preview-12-2025` does NOT (verified by probe);
+  switch via `SIRIOUS_MODEL=gemini-3.1-flash-live-preview` at deploy time.
+  Transcript-replay fallback remains a later Phase 2 addition.
 
 **Out:**
 

@@ -2,6 +2,7 @@ import os
 import asyncio
 import contextlib
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -12,7 +13,48 @@ from google.genai import types
 
 app = FastAPI()
 
-MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+# Model is env-configurable so Cloud Run can switch without a code change.
+# NOTE (verified 21 Aug by direct probe): gemini-2.5-flash-native-audio-* NEVER
+# emits a RESUMABLE session_resumption handle → session resumption stays
+# dormant on it. gemini-3.1-flash-live-preview DOES (handle arrives right
+# after the first turn completes). Set SIRIOUS_MODEL to enable resumption.
+MODEL = os.environ.get(
+    "SIRIOUS_MODEL",
+    "gemini-2.5-flash-native-audio-preview-12-2025",
+)
+
+# ── Session resumption (protocol v2) ────────────────────────────────────────
+# Maps a client-supplied stable session id → the latest Gemini resumption
+# handle, so a reconnecting client can resume the SAME Gemini session (model
+# memory intact) instead of starting fresh. Handles are valid for 2 h after
+# the session ends (Gemini docs: ai.google.dev/gemini-api/docs/live-session).
+# In-memory by design: single-instance Cloud Run service. A recycled instance
+# simply loses resumability — clients fall back to a fresh session.
+RESUME_HANDLE_TTL_S = 2 * 60 * 60  # 2 hours
+
+_resume_handles: dict[str, dict] = {}
+
+
+def _store_handle(client_session_id: str, handle: str) -> None:
+    _resume_handles[client_session_id] = {
+        "handle": handle,
+        "updated_at": time.monotonic(),
+    }
+
+
+def _pop_handle(client_session_id: str):
+    """Return a still-valid handle for this id (and drop expired entries)."""
+    entry = _resume_handles.get(client_session_id)
+    if entry is None:
+        return None
+    if time.monotonic() - entry["updated_at"] > RESUME_HANDLE_TTL_S:
+        del _resume_handles[client_session_id]
+        return None
+    return entry["handle"]
+
+
+def _drop_handle(client_session_id: str) -> None:
+    _resume_handles.pop(client_session_id, None)
 
 
 def now():
@@ -40,14 +82,28 @@ async def health():
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(
+    websocket: WebSocket,
+    client_session_id: str | None = None,
+):
     await websocket.accept()
 
     session_id = str(uuid.uuid4())
 
+    # ── Session resumption ──────────────────────────────────────────────────
+    # A client that wants continuity across reconnects sends a stable
+    # client_session_id. If we hold a live resumption handle for it, resume
+    # the SAME Gemini session; otherwise start fresh.
+    resumed = False
+    resume_handle = _pop_handle(client_session_id) if client_session_id else None
+    if resume_handle is not None:
+        resumed = True
+
     log_event(
         session_id,
         "session_started",
+        client_session_id=client_session_id,
+        resumed=resumed,
     )
 
     client = genai.Client(
@@ -154,6 +210,13 @@ async def websocket_endpoint(websocket: WebSocket):
             config=types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
 
+                # Resume the previous Gemini session when the client
+                # reconnects with a known client_session_id (handle=None
+                # simply starts a fresh session).
+                session_resumption=types.SessionResumptionConfig(
+                    handle=resume_handle,
+                ),
+
                 # Pin the assistant's OUTPUT language. Native-audio models
                 # cannot be hard-locked via language_code (unsupported), and
                 # Gemini's automatic speech-language detection is unreliable
@@ -180,6 +243,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.send_json({
                 "type": "session_started",
                 "session_id": session_id,
+                "resumed": resumed,
             })
 
             async def client_to_gemini():
@@ -236,6 +300,11 @@ async def websocket_endpoint(websocket: WebSocket):
                             )
 
                             if control == "stop":
+                                # Clean end — the conversation is over. Drop
+                                # the resumption handle so a future session
+                                # with this client_session_id starts fresh.
+                                if client_session_id:
+                                    _drop_handle(client_session_id)
                                 break
 
                             elif control == "ping":
@@ -329,10 +398,20 @@ async def websocket_endpoint(websocket: WebSocket):
                                     and update.new_handle
                                 ):
 
+                                    # Persist for a future reconnect from the
+                                    # same client_session_id (no-op when the
+                                    # client didn't supply one).
+                                    if client_session_id:
+                                        _store_handle(
+                                            client_session_id,
+                                            update.new_handle,
+                                        )
+
                                     log_event(
                                         session_id,
                                         "session_resumption",
                                         handle_received=True,
+                                        stored=bool(client_session_id),
                                     )
 
                                     await websocket.send_json({

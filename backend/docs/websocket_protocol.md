@@ -154,13 +154,60 @@ Sent once after Gemini Live connects.
 ```json
 {
   "type": "session_started",
-  "session_id": "550e8400-e29b-41d4-a716-446655440000"
+  "session_id": "550e8400-e29b-41d4-a716-446655440000",
+  "resumed": false
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `session_id` | string (UUID) | Server-assigned ID for logs and future persistence |
+| `session_id` | string (UUID) | Server-assigned ID for THIS connection (changes on every reconnect) |
+| `resumed` | bool (**v2**) | true when the Gemini conversation context was restored from a previous connection — see [Session resumption](#session-resumption-protocol-v2) below |
+
+---
+
+## Session resumption (protocol v2)
+
+Keeps the **Gemini model's memory** alive across network blips. Without it,
+every reconnect starts a fresh Gemini session: the on-screen transcript is
+preserved client-side, but the model forgets everything said before the drop.
+
+### How it works
+
+1. The client generates a stable `client_session_id` when the user starts a
+   session and sends it as a WebSocket **query parameter** on every connect:
+   `/ws?client_session_id=<id>`. It reuses the same id across reconnects and
+   clears it only when the user ends the session.
+2. The backend enables `session_resumption` on its Gemini Live connection and
+   stores every resumable handle it receives, keyed by `client_session_id`
+   (in-memory, 2 h TTL — matching Gemini's handle validity).
+3. On reconnect with a known id + live handle, the backend passes the handle
+   to Gemini (`SessionResumptionConfig.handle`) → the SAME Gemini session is
+   resumed and `session_started.resumed=true` is sent. Unknown/expired id →
+   fresh session (`resumed=false`). A clean `stop` from the client deletes the
+   stored handle, so the next Start begins genuinely fresh.
+4. Fallback is automatic: if no valid handle exists (expired, instance
+   recycled, or the model never issued one), the reconnect behaves like the
+   v1 flow.
+
+### Model requirement (IMPORTANT, verified 21 Aug 2026)
+
+Resumption only works on models that actually emit **resumable** handles:
+
+| Model | Resumable handles |
+|---|---|
+| `gemini-2.5-flash-native-audio-preview-12-2025` | ❌ never (only a non-resumable setup update) |
+| `gemini-3.1-flash-live-preview` | ✅ yes (arrives right after the first turn completes) |
+
+The backend reads `SIRIOUS_MODEL` (env var) so this can be switched at deploy
+time without a code change. Default remains the 2.5 native-audio preview until
+the model upgrade is done deliberately.
+
+### Client UX
+
+On reconnect, the on-screen log shows which path was taken:
+- `Reconnected — Gemini context RESUMED (after N retries)` — memory intact
+- `Reconnected after N retries (fresh Gemini context)` — v1 fallback
 
 ---
 
@@ -263,7 +310,10 @@ Gemini signaled an upcoming session lifecycle event (typically `go_away` before 
 | `code` | string | Currently `"GO_AWAY"` |
 | `time_left` | string | Human-readable time until Gemini session ends |
 
-Automatic server-side resumption is **not** implemented yet. Clients may log this and prepare for reconnect in a future protocol version.
+Automatic server-side resumption **is implemented (protocol v2)** — see
+[Session resumption](#session-resumption-protocol-v2). On `go_away` the client
+may proactively reconnect with its `client_session_id` to continue the same
+Gemini conversation on a fresh connection.
 
 ---
 
@@ -282,7 +332,9 @@ Server received a resumable session handle from Gemini (for future reconnect).
 |-------|------|-------------|
 | `handle` | string | Opaque Gemini resumption token |
 
-No automatic resume is performed today. Store only if implementing client-driven reconnection later.
+**v2:** the backend stores this handle server-side keyed by the client's
+`client_session_id` and uses it automatically on reconnect — clients do not
+need to store or return it. See [Session resumption](#session-resumption-protocol-v2).
 
 ---
 
@@ -477,7 +529,9 @@ Planned improvements may add:
 - JSON control messages (`session.stop`) instead of plain text
 - `session_ended` event to client
 - `turn_id` on transcript events for client correlation
-- Automatic session resumption without client action
+
+~~Automatic session resumption without client action~~ → **done in protocol v2**
+(see [Session resumption](#session-resumption-protocol-v2)).
 
 Clients should ignore unknown JSON fields and unknown `type` values for forward compatibility.
 
