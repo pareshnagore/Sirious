@@ -85,10 +85,15 @@ Product phases span multiple layers. A single product phase may complete parts o
   resumes Listening; mid-utterance partial turn committed so nothing is lost;
   keepalive ping + stall watchdog catches sockets that silently stop; verified live
   (airplane-mode toggle: Listening → Reconnecting → Listening, transcript preserved)
-🟡 Barge-in latency measured on device (target ~200–500 ms)
-🟡 Full "smooth voice experience" acceptance on device
+✅ Barge-in latency measured on device (target ~200–500 ms) — user-verified 21 Aug:
+   interruption behavior BETTER on gemini-3.1-flash-live than the 2.5 native-audio model
+✅ Full "smooth voice experience" acceptance on device — user-accepted 21 Aug
 ✅ Release APK (signed) — built & verified on 20 Aug 2026 (see "Android build/keystore" below)
-❌ Upstream protocol/docs re-verification as needed
+✅ Upstream protocol/docs re-verification — done 21 Aug (official Live session-management
+   docs cross-checked; websocket_protocol.md updated to v2: session resumption)
+✅ BONUS (Phase 2 item pulled forward): session resumption across network blips —
+   implemented + user-verified on device 21 Aug; prod runs gemini-3.1-flash-live
+   (SIRIOUS_MODEL env var) since 2.5-native-audio never emits resumable handles
 ```
 
 ### Android build toolchain + keystore (20 Aug 2026)
