@@ -233,6 +233,12 @@ def test_store_failure_does_not_kill_writer(make_store, monkeypatch):
 
 # ── Helpers / null store ────────────────────────────────────────────────────
 
+def test_firestore_async_client_import_name():
+    """Regression: prod 503'd because store.py imported a nonexistent class.
+    The fake-DB tests monkeypatch _ensure_db, so only this catches it."""
+    from google.cloud.firestore import AsyncClient  # noqa: F401
+
+
 def test_make_title_truncates():
     t = make_title("  a " * 100)
     assert len(t) == 80

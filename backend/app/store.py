@@ -67,7 +67,7 @@ class SessionStore:
         if self._db is None:
             # Imported lazily so environments without the package (or
             # without ADC) can still import this module for Null-mode use.
-            from google.cloud.firestore import AsyncFirestoreClient
+            from google.cloud.firestore import AsyncClient
 
             project = os.environ.get("GCP_PROJECT") or os.environ.get(
                 "GOOGLE_CLOUD_PROJECT"
@@ -75,7 +75,7 @@ class SessionStore:
             kwargs: dict[str, Any] = {}
             if project:
                 kwargs["project"] = project
-            self._db = AsyncFirestoreClient(**kwargs)
+            self._db = AsyncClient(**kwargs)
         return self._db
 
     def _enqueue(self, kind: str, doc_id: str, payload: dict[str, Any]) -> None:
