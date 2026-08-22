@@ -136,6 +136,7 @@ Signing keys (`upload-keystore.jks`, `key.properties`) are **gitignored — repo
 * **Phase 0 (done ~16 Aug)** — Python diagnostic client (`test_continuous.py`) proved the full loop: mic → WebSocket → Cloud Run → Gemini Live → back → speaker. Established structured event logging and `turn_summary` records. Proved Gemini detects interruptions server-side.
 * **Phase 1 (done 21 Aug)** — real Flutter Android client: state machine (IDLE→CONNECTING→LISTENING⇄RESPONDING/PLAYING/INTERRUPTING), per-turn transcript aggregation, barge-in flush + on-device measurement, network-blip auto-reconnect with backoff + keepalive stall watchdog, signed release APK, modern build toolchain. Accepted on device.
 * **Protocol v2 bonus (21 Aug, pulled forward from Phase 2)** — session resumption: stable `client_session_id` from the client, server-side handle store (2 h TTL), same-Gemini-session resume on reconnect, `resumed` flag surfaced in UI. Verified end-to-end: fact spoken → socket hard-dropped → reconnect → model still knew the fact. In production.
+* **Phase 2 (done 22 Aug)** — persistent session history: Firestore (native, asia-south1) with one doc per logical conversation (`client_session_id`; resuming reconnects extend the same doc), async queue+writer with turn-level writes and disconnect flush that can never block or break the voice path; REST history API; bearer-token auth on REST + WS handshake; mobile History/Transcript screens with token in `flutter_secure_storage`; transcript-replay fallback (recent turns injected into `system_instruction` when no live resume handle exists). E2E verified on device: spoken question → Gemini → Firestore → REST → phone screen; replay fallback verified live across sessions.
 
 ---
 
@@ -163,10 +164,10 @@ Phase 1  Flutter mobile client                   ✅ closed 21 Aug 2026
          ├ signed release APK                    ✅
          └ smooth-voice acceptance               ✅ user-accepted 21 Aug
 Session resumption (protocol v2)                 ✅ implemented, deployed, verified
-Persistent transcript storage                    ❌ Phase 2 (turn_summary data already logged)
-History/search UI                                ❌ Phase 2
-Transcript-replay fallback (resume expired)      ❌ Phase 2 (deferred)
-Auth                                             ❌ Phase 2 dependency
+Persistent transcript storage                    ✅ Phase 2 done 22 Aug 2026 (Firestore)
+History/search UI                                ✅ Phase 2 (list + transcript detail on device)
+Transcript-replay fallback (resume expired)      ✅ Phase 2 (live-verified 22 Aug)
+Auth                                             ✅ Phase 2 (bearer token, REST + WS)
 Long-term memory                                 ❌ Phase 3
 Tools / actions                                  ❌ Phase 4+
 ```
@@ -177,8 +178,7 @@ Tools / actions                                  ❌ Phase 4+
 
 Phased plan with scope-in/scope-out lives in `product_phases.md`. Shape of the road:
 
-* **Phase 2 — Session history & review:** persist `turn_summary` streams (the data is already being generated every turn), async writes that never block the live socket, storage choice (Firestore leans favorite for this scale), in-app history + transcript views, replay-fallback for expired resume handles, lightweight auth.
-* **Phase 3 — Contextual memory:** extraction pipeline over transcripts → episodic/semantic/entity/task memories. Never store raw transcripts as memory.
+* **Phase 3 — Contextual memory:** extraction pipeline over transcripts → episodic/semantic/entity/task memories. Never store raw transcripts as memory. The Phase 2 Firestore store is the raw material.
 * **Phase 4+ — Tools, calendar/email/files, then agentic behavior.** The voice interface becomes the front door to an agent, not the agent itself.
 
 Layering principle (unchanged since the start): transport → conversation management → client UX → persistence → memory → tools → autonomy. Build in order; don't merge layers prematurely.
@@ -187,4 +187,4 @@ Layering principle (unchanged since the start): transport → conversation manag
 
 # 10. One-line status
 
-> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity across reconnects in production — Phase 1 closed 21 Aug 2026; next: Phase 2 transcript persistence and history.**
+> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity AND persistent, browsable history in production — Phase 2 closed 22 Aug 2026; next: Phase 3 contextual memory.**

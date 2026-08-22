@@ -1,7 +1,7 @@
 # Sirious WebSocket Protocol
 
 **Protocol version:** `1`  
-**Last aligned with:** `backend/app/main.py` (16 August 2026)
+**Last aligned with:** `backend/app/main.py` (22 August 2026 — Phase 2 auth + history)
 
 This document is the contract between the Sirious server and clients (Flutter, Python test clients, etc.). It reflects **actual server behavior**, not a planned API.
 
@@ -33,16 +33,37 @@ Each WebSocket connection creates one server `session_id`, one Gemini Live sessi
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/ws` | WebSocket | Real-time voice session |
-| `/health` | GET | Liveness check → `{"status": "ok"}` |
+| `/health` | GET | Liveness check → `{"status": "ok"}` (no auth) |
+| `/sessions` | GET | Session history list, newest first (**auth**) |
+| `/sessions/{id}` | GET | Full transcript of one session (**auth**) |
 
 ### Production URL (current deployment)
 
 ```text
 wss://sirious-api-635321277027.asia-south1.run.app/ws
+https://sirious-api-635321277027.asia-south1.run.app/sessions
 https://sirious-api-635321277027.asia-south1.run.app/health
 ```
 
 Region: `asia-south1` · GCP project: `sirious-2026`
+
+---
+
+## Authentication (Phase 2)
+
+When the server has `SIRIOUS_AUTH_TOKEN` set (always true in production), every
+endpoint requires a static bearer token:
+
+- **REST** — header `Authorization: Bearer <token>`; missing/wrong token → `401`.
+- **WebSocket** — query parameter `/ws?token=<token>`; missing/wrong token is
+  rejected at the **handshake**, before `accept()`, so no Gemini session is ever
+  opened for an unauthenticated peer. Clients see the HTTP upgrade fail
+  (`401`/`403`).
+
+The mobile client stores the token in `flutter_secure_storage` (Android
+Keystore-backed) and appends it to both the REST calls and the WS URL.
+`/health` stays open for liveness probes. If `SIRIOUS_AUTH_TOKEN` is unset
+(local dev), all endpoints are open.
 
 ---
 
@@ -533,7 +554,93 @@ Planned improvements may add:
 ~~Automatic session resumption without client action~~ → **done in protocol v2**
 (see [Session resumption](#session-resumption-protocol-v2)).
 
+~~Persistent session history + REST readback~~ → **done in Phase 2** (below).
+
 Clients should ignore unknown JSON fields and unknown `type` values for forward compatibility.
+
+---
+
+## Session history REST API (Phase 2)
+
+Every conversation is persisted to Firestore (one document per **logical**
+conversation — the doc id equals the client's `client_session_id`, so a
+resuming reconnect extends the same document). Writes are turn-level via an
+async writer; nothing in the voice hot path blocks on Firestore, and a
+disconnect flushes the final state. All endpoints require
+`Authorization: Bearer <token>`.
+
+### `GET /sessions?limit=50`
+
+Newest-first list (ordered by last update).
+
+```json
+{
+  "sessions": [
+    {
+      "id": "b1a0…",
+      "title": "what did we discuss about Mumbai?",
+      "preview": "Mumbai is the capital of…",
+      "started_at": "2026-08-22T03:30:00+00:00",
+      "ended_at": "2026-08-22T03:36:12+00:00",
+      "duration_s": 372.4,
+      "turn_count": 9,
+      "model": "gemini-3.1-flash-live-preview",
+      "updated_ms": 1787368000000
+    }
+  ]
+}
+```
+
+`title` is the first user utterance (truncated to 80 chars), `preview` is the
+tail of the last assistant reply.
+
+### `GET /sessions/{id}`
+
+```json
+{
+  "id": "b1a0…",
+  "title": "…",
+  "model": "…",
+  "device": "<client User-Agent>",
+  "started_at": "…",
+  "ended_at": "…",
+  "duration_s": 372.4,
+  "end_reason": "session_ended",
+  "resume_count": 1,
+  "turn_count": 9,
+  "turns": [
+    {
+      "id": "turn-uuid",
+      "started_at": "…",
+      "ended_at": "…",
+      "user_text": "full user utterance",
+      "assistant_text": "full assistant utterance",
+      "interrupted": false,
+      "reason": "turn_complete"
+    }
+  ]
+}
+```
+
+Errors: `401` no/ bad token · `404` unknown id · `503` store temporarily
+unavailable.
+
+**Data model note:** `resume_count > 0` marks sessions that survived network
+blips; turns carry an `interrupted` flag from barge-ins. Audio bytes are
+persisted as counters only — transcripts are text-first (audio archival is out
+of scope until a later phase).
+
+### Transcript-replay fallback (Phase 2, verified live 22 Aug)
+
+When a client reconnects with a `client_session_id` that has **no live
+resumption handle** (clean end dropped it, 2 h expiry passed, or the instance
+was recycled), the backend fetches that conversation's recent turns (last 12)
+from Firestore and injects them into the Gemini `system_instruction` before
+connecting. Result: conversational memory survives even without native
+session resumption. The lookup happens once at connect time and is
+best-effort — on failure the session simply starts fresh. Verified live:
+fact stated in conversation 1 → clean stop → brand-new session asked about
+the fact → answered correctly from replay.
 
 ---
 

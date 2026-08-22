@@ -49,7 +49,7 @@ Product phases span multiple layers. A single product phase may complete parts o
 
 ## Current status
 
-**Phase 0 is largely complete.**
+**Phase 2 (session history & review) is complete — implemented, deployed, verified end-to-end on device (22 Aug 2026).**
 
 ```text
 ✅ Cloud Run WebSocket bridge
@@ -58,13 +58,17 @@ Product phases span multiple layers. A single product phase may complete parts o
 ✅ Input & output transcription
 ✅ Turn detection & Gemini barge-in detection
 ✅ Structured server logging & turn summaries
-🟡 Session resumption (detected, not automated)
-🟡 Flutter mobile client builds & runs on device (Phase 1 in progress)
-❌ Persistent storage
+✅ Session resumption (protocol v2, automated)
+✅ Flutter mobile client (Phase 1 closed 21 Aug 2026)
+✅ Firestore persistence: turn-level writes, async writer, flush on disconnect
+✅ Bearer-token auth on REST + WS handshake (SIRIOUS_AUTH_TOKEN)
+✅ History REST API (GET /sessions, GET /sessions/{id}) + mobile history UI
+✅ On-device E2E verified: voice → Gemini → Firestore → REST → phone screen
+✅ Transcript-replay fallback for expired resume handles (live-verified)
 ❌ Memory, tools, multi-speaker, vision
 ```
 
-**Active focus:** Phase 1 — real mobile client with proper audio architecture.
+**Active focus:** Phase 2 — session history & review (backend live; verify E2E, then replay fallback).
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -252,7 +256,7 @@ User opens app → taps to start session → speaks naturally → hears response
 
 ---
 
-## Phase 2 — Session history & review (NEXT)
+## Phase 2 — Session history & review (DONE 22 Aug 2026)
 
 ### Goal
 
@@ -264,24 +268,33 @@ Conversations are **saved and searchable**. User can revisit what was said and b
 - Can search past sessions ("what did we discuss about Mumbai?")
 - Can start a new session with optional reference to past context
 
-### Scope
+### Progress (22 Aug 2026)
 
-**In:**
+```text
+✅ Firestore (native, asia-south1) persistence — one doc per logical
+   conversation (doc id = client_session_id; resuming reconnect extends
+   the same doc), async queue+writer, turn-level writes, disconnect flush;
+   writer failures can never take down the voice path
+✅ REST API: GET /sessions (list) + GET /sessions/{id} (full transcript)
+✅ Bearer-token auth on REST + WS handshake (rejected before accept());
+   token lives in flutter_secure_storage on device
+✅ Mobile: History list + Transcript detail screens, key-icon token entry,
+   WS client sends ?token= — verified on device with live prod data
+✅ E2E proven in prod: spoken question → Gemini answer → Firestore →
+   REST → phone screen ("The capital of Japan is Tokyo.")
+✅ Transcript-replay fallback: no live resume handle → recent turns from
+   Firestore injected into system_instruction at connect; live-verified
+   (fact → clean stop → fresh session still knew the fact)
+```
 
-- Persist `turn_summary` data (user text, assistant text, timestamps, interruption flags)
-- Session metadata (start/end, device, duration)
-- Storage backend (Firestore, Cloud SQL, or BigQuery — choose one)
-- Async write path (must not block real-time WebSocket)
-- Simple in-app history list + transcript detail view
+**Out:**
+
 - ~~Server-side session resumption on `go_away`~~ → **DONE (21 Aug 2026, protocol v2)** —
   client stable `client_session_id` + backend handle store/resume; verified live:
   spoke a fact → hard socket drop → reconnected (`resumed=true`) → Gemini still knew the fact.
-  ⚠️ Requires a model that emits resumable handles — current prod model
-  `gemini-2.5-flash-native-audio-preview-12-2025` does NOT (verified by probe);
-  switch via `SIRIOUS_MODEL=gemini-3.1-flash-live-preview` at deploy time.
-  Transcript-replay fallback remains a later Phase 2 addition.
+- ~~Transcript-replay fallback for expired handles~~ → **DONE 22 Aug 2026** (see above).
 
-**Out:**
+**Out (still):**
 
 - Semantic memory extraction
 - Speaker attribution
@@ -290,10 +303,10 @@ Conversations are **saved and searchable**. User can revisit what was said and b
 
 ### Success criteria
 
-- [ ] Every completed turn persisted within seconds of `turn_complete`
-- [ ] User can open a past session and read full transcript
-- [ ] Sessions longer than 8 minutes work via server-side resumption
-- [ ] No data loss on normal disconnect
+- [x] Every completed turn persisted within seconds of `turn_complete`
+- [x] User can open a past session and read full transcript
+- [x] Sessions longer than 8 minutes work via server-side resumption
+- [x] No data loss on normal disconnect
 
 ### Dependencies
 
