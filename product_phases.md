@@ -47,9 +47,9 @@ Product phases span multiple layers. A single product phase may complete parts o
 
 ---
 
-## Current status
+**Current status**
 
-**Phase 2 (session history & review) is complete — implemented, deployed, verified end-to-end on device (22 Aug 2026).**
+**Phase 3 (contextual memory) is complete — deployed, recall-test PASS in prod, user-accepted on device (22 Aug 2026).**
 
 ```text
 ✅ Cloud Run WebSocket bridge
@@ -65,10 +65,13 @@ Product phases span multiple layers. A single product phase may complete parts o
 ✅ History REST API (GET /sessions, GET /sessions/{id}) + mobile history UI
 ✅ On-device E2E verified: voice → Gemini → Firestore → REST → phone screen
 ✅ Transcript-replay fallback for expired resume handles (live-verified)
-❌ Memory, tools, multi-speaker, vision
+✅ Contextual memory (Phase 3, 22 Aug 2026): extraction pipeline, embeddings,
+   dedup, wallet injection, agentic search tool, Memories UI, session
+   deletion with memory cascade — recall test PASS in prod
+❌ Tools beyond memory-search, multi-speaker, vision
 ```
 
-**Active focus:** Phase 2 — session history & review (backend live; verify E2E, then replay fallback).
+**Active focus:** Phase 3 closed 22 Aug 2026. Next: **Phase 4 — tools & actions** (calendar, reminders, web search via the same function-calling layer the memory tool proved out).
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -317,7 +320,7 @@ Conversations are **saved and searchable**. User can revisit what was said and b
 
 ---
 
-## Phase 3 — Contextual memory (IN PROGRESS — backend built 22 Aug 2026, deploy pending)
+## Phase 3 — Contextual memory (DONE 22 Aug 2026 — deployed, recall-test PASS, user-accepted on device)
 
 ### Goal
 
@@ -377,10 +380,10 @@ topics, not just keywords.
 
 ### Success criteria
 
-- [ ] Facts mentioned in session N are usable in session N+1 without user re-stating them
-- [ ] **Recall test:** "Did I have any conversation about birds?" after an earlier peacock-color session → "Yes — you talked about peacocks and asked their color" (topic-level episodic recall with provenance)
-- [ ] User can see and delete stored memories
-- [ ] Memory injection does not blow context window or add unacceptable latency
+- [x] Facts mentioned in session N are usable in session N+1 without user re-stating them
+- [x] **Recall test:** "Did I have any conversation about birds?" after an earlier peacock-color session → "Yes — you talked about peacocks and asked their color" (topic-level episodic recall with provenance) — **PASS live in prod** (harness + manual on-device)
+- [x] User can see and delete stored memories — Memories screen (view/search/delete) verified by Paresh on device
+- [x] Memory injection does not blow context window or add unacceptable latency (bounded block, injected once per connect)
 
 ### Progress (22 Aug 2026 — M1–M4 built locally, tests green; deploy + on-device E2E pending user go-ahead)
 
@@ -409,12 +412,32 @@ topics, not just keywords.
    color") and N+1 ("did I talk about birds?") on DIFFERENT client_session_ids
    (so replay fallback can't explain a pass), polls /memories until session
    N's provenance appears, asserts "peacock" in the answer
-✅ Tests: 34 pass (13 new Phase 3: extraction/watermark/dedup/ranking/
-   injection-bounds/null-mode/REST incl. 503 paths)
-❌ Deploy to Cloud Run (needs SIRIOUS_MEMORY=1 added to the env set;
-   recommend --no-cpu-throttling so post-session extraction isn't starved)
-❌ On-device E2E recall test + Memories UI against prod
+✅ Tests: 36 pass (15 new Phase 3: extraction/watermark/dedup/ranking/
+   injection-bounds/null-mode/REST incl. 503 paths/provenance cascade)
+❌ ~~Deploy to Cloud Run~~ → **DONE 22 Aug** (revisions 00023–00027;
+   SIRIOUS_MEMORY=1 + --no-cpu-throttling)
+❌ ~~On-device E2E recall test + Memories UI against prod~~ → **DONE 22 Aug**
+   (recall harness PASS; Paresh verified Memories screen, search, deletion
+   and live voice recall on device)
+✅ Agentic recall (Paresh's call — Option B): `search_past_conversations`
+   function-calling tool on the Live session; model decides when to search,
+   server embeds query → cosine over all memories → top-5 hits WITH scores
+   (the model judges relevance itself). Live-proven both directions:
+   birds→peacock PASS; kangaroo probe answered honestly "no kangaroo
+   conversations… we've discussed birds and peacocks"
+✅ Session deletion with memory cascade (P3 add-on): DELETE /sessions/{id}
+   hard-deletes the doc, strips its provenance entries from memories,
+   removes sourceless memories, drops the extraction watermark. Mobile:
+   swipe-to-delete on History with confirm dialog. Live-verified.
 ```
+
+#### Deployment notes (learned the hard way)
+
+- `gemini-2.5-flash` (extraction default) was RETIRED by Google — prod logs
+  404'd on first extraction. Now `gemini-3.6-flash` via SIRIOUS_EXTRACT_MODEL.
+- `FunctionResponse` MUST echo `fc.id` or Google AI 400s the whole Live
+  session — symptom: silence (no audio out, no turn_complete), only visible
+  in structured logs as `gemini_error`.
 
 #### Design decisions worth remembering
 

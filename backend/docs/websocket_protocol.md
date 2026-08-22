@@ -682,6 +682,26 @@ Returns `{"deleted": true, "id": "…"}`, or `404` for unknown ids.
 
 Errors: `401` no/ bad token · `503` memory store unavailable.
 
+### Agentic memory search (Phase 3, live)
+
+When `SIRIOUS_MEMORY=1`, every Live session carries a
+`search_past_conversations` function declaration. When the model judges a
+question reaches beyond its injected context ("did we ever talk about X?"),
+it calls the tool; the server embeds the query, cosine-ranks ALL active
+memories, and returns the top-5 with text, type, score, date and
+session_ref. The MODEL decides relevance from the scores (weak matches on
+unrelated topics get honestly dismissed). Round-trip visible in structured
+logs as `tool_called` / `tool_result`.
+
+### Session deletion (Phase 3 add-on)
+
+`DELETE /sessions/{id}` removes the conversation document AND cascades into
+memory: every provenance entry citing it is stripped; memories left with no
+sources are hard-deleted; the extraction watermark is dropped. Mobile:
+swipe-to-delete on History rows with confirmation. Returns
+`{"deleted": true, "id": "…", "memories": {"memories_updated": N,
+"memories_deleted": M}}`.
+
 ---
 
 ## Quick reference
