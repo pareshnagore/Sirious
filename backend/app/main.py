@@ -7,8 +7,12 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
 from google import genai
 from google.genai import types
+
+from .store import get_store
 
 
 app = FastAPI()
@@ -22,6 +26,44 @@ MODEL = os.environ.get(
     "SIRIOUS_MODEL",
     "gemini-2.5-flash-native-audio-preview-12-2025",
 )
+
+# ── Lightweight auth (Phase 2) ──────────────────────────────────────────────
+# Static bearer token. When SIRIOUS_AUTH_TOKEN is set, ALL endpoints — the
+# REST history API AND the /ws handshake — require it. Unset → open access
+# (local dev only; Cloud Run always sets it).
+AUTH_TOKEN = os.environ.get("SIRIOUS_AUTH_TOKEN")
+
+
+def _check_auth(authorization: str | None) -> None:
+    if not AUTH_TOKEN:
+        return
+    if authorization != f"Bearer {AUTH_TOKEN}":
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+async def require_auth(
+    authorization: str | None = Header(default=None),
+) -> None:
+    _check_auth(authorization)
+
+
+def check_ws_auth(websocket: WebSocket, client_session_id: str | None) -> bool:
+    """Handshake auth: token must arrive as ?token=... (browsers/WS clients
+    can't set custom headers universally). Reject with 401 before accept()."""
+    if not AUTH_TOKEN:
+        return True
+    supplied = websocket.query_params.get("token")
+    if supplied != AUTH_TOKEN:
+        log_event(
+            str(uuid.uuid4()),
+            "ws_auth_rejected",
+        )
+        return False
+    return True
 
 # ── Session resumption (protocol v2) ────────────────────────────────────────
 # Maps a client-supplied stable session id → the latest Gemini resumption
@@ -81,11 +123,67 @@ async def health():
     return {"status": "ok"}
 
 
+# ── Session history API (Phase 2) ───────────────────────────────────────────
+
+@app.get("/sessions")
+async def list_sessions(
+    limit: int = Query(default=50, ge=1, le=200),
+    _: None = Depends(require_auth),
+):
+    try:
+        items = await get_store().list_sessions(limit=limit)
+    except Exception as e:  # noqa: BLE001 — report, don't crash
+        log_event("rest", "sessions_list_error", error=repr(e))
+        return JSONResponse(status_code=503, content={"detail": "store unavailable"})
+    return {"sessions": items}
+
+
+@app.get("/sessions/{doc_id}")
+async def get_session(
+    doc_id: str,
+    _: None = Depends(require_auth),
+):
+    try:
+        doc = await get_store().get_session(doc_id)
+    except Exception as e:  # noqa: BLE001 — report, don't crash
+        log_event("rest", "session_get_error", error=repr(e), doc_id=doc_id)
+        return JSONResponse(status_code=503, content={"detail": "store unavailable"})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    turns = doc.get("turns") or []
+    return {
+        "id": doc_id,
+        **{k: doc.get(k) for k in (
+            "client_session_id", "title", "model", "device", "started_at",
+            "ended_at", "duration_s", "end_reason", "resume_count",
+            "turn_count",
+        )},
+        "turns": [
+            {
+                "id": t.get("id"),
+                "started_at": t.get("started_at"),
+                "ended_at": t.get("ended_at"),
+                "user_text": t.get("user_text") or "",
+                "assistant_text": t.get("assistant_text") or "",
+                "interrupted": bool(t.get("interrupted")),
+                "reason": t.get("reason"),
+            }
+            for t in turns
+        ],
+    }
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
     client_session_id: str | None = None,
 ):
+    # Handshake auth (Phase 2): reject BEFORE accept so no Gemini session
+    # is ever opened for an unauthenticated peer.
+    if not check_ws_auth(websocket, client_session_id):
+        await websocket.close(code=4401, reason="unauthorized")
+        return
+
     await websocket.accept()
 
     session_id = str(uuid.uuid4())
@@ -98,6 +196,20 @@ async def websocket_endpoint(
     resume_handle = _pop_handle(client_session_id) if client_session_id else None
     if resume_handle is not None:
         resumed = True
+
+    # Persistence (Phase 2): one Firestore doc per LOGICAL conversation —
+    # doc id == client_session_id, so a resuming reconnect EXTENDS the same
+    # document rather than creating a new one.
+    store = get_store()
+    doc_id = client_session_id or session_id
+    store.start_session(
+        doc_id,
+        client_session_id=client_session_id,
+        model=MODEL,
+        resumed=resumed,
+        device=websocket.headers.get("user-agent"),
+        now_iso=now(),
+    )
 
     log_event(
         session_id,
@@ -187,6 +299,26 @@ async def websocket_endpoint(
             generation_complete=turn_generation_complete,
             turn_complete=turn_complete,
             interrupted=turn_interrupted,
+        )
+
+        # Persist this turn (Phase 2). Non-blocking enqueue; the store's
+        # writer task owns the actual Firestore write.
+        store.record_turn(
+            doc_id,
+            summary={
+                "turn_id": turn_id,
+                "started_at": turn_started_at,
+                "ended_at": now(),
+                "reason": reason,
+                "user_text": user_text.strip(),
+                "assistant_text": assistant_text.strip(),
+                "audio_in_bytes": turn_audio_in_bytes,
+                "audio_out_bytes": turn_audio_out_bytes,
+                "generation_complete": turn_generation_complete,
+                "turn_complete": turn_complete,
+                "interrupted": turn_interrupted,
+            },
+            now_iso=now(),
         )
 
         # Reset turn state
@@ -665,6 +797,18 @@ async def websocket_endpoint(
             finish_turn(
                 "session_ended"
             )
+
+        # Finalize the Firestore doc (Phase 2). The queued session_end op
+        # carries the full buffered turns array, so even if the instance is
+        # killed right now every completed turn was already written
+        # turn-by-turn above.
+        store.end_session(
+            doc_id,
+            now_iso=now(),
+            reason="session_ended",
+            audio_in_bytes=audio_in_bytes,
+            audio_out_bytes=audio_out_bytes,
+        )
 
         log_event(
             session_id,
