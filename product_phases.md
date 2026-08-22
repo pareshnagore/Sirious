@@ -317,7 +317,7 @@ Conversations are **saved and searchable**. User can revisit what was said and b
 
 ---
 
-## Phase 3 — Contextual memory (NEXT)
+## Phase 3 — Contextual memory (IN PROGRESS — backend built 22 Aug 2026, deploy pending)
 
 ### Goal
 
@@ -381,6 +381,56 @@ topics, not just keywords.
 - [ ] **Recall test:** "Did I have any conversation about birds?" after an earlier peacock-color session → "Yes — you talked about peacocks and asked their color" (topic-level episodic recall with provenance)
 - [ ] User can see and delete stored memories
 - [ ] Memory injection does not blow context window or add unacceptable latency
+
+### Progress (22 Aug 2026 — M1–M4 built locally, tests green; deploy + on-device E2E pending user go-ahead)
+
+```text
+✅ Backend app/memory.py: MemoryStore mirroring store.py's pattern — async
+   queue + single writer task, hot path never blocks or breaks the voice
+   loop; SIRIOUS_MEMORY=1 gate + NullMemoryStore for local dev
+✅ Extraction: one flash-model call per session end (structured JSON:
+   type/text/topics/entities/turn_refs), turn-ID watermarked per doc so a
+   resumed conversation re-extracts only its tail; failures leave the
+   watermark untouched and retry at next extraction
+✅ Embeddings: gemini-embedding-001 (RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY,
+   768-dim) stored on each memory doc
+✅ Dedup: cosine ≥ 0.90 → append provenance + bump times_seen instead of
+   inserting a duplicate memory
+✅ Retrieval: exact in-process cosine ranking over active memories (no
+   Firestore vector index needed at personal scale)
+✅ Injection: bounded memory block (top facts/tasks + date-stamped recent
+   episodic index) into system_instruction at every WS connect
+✅ REST: GET /memories (list or ?q= semantic search), DELETE /memories/{id}
+   (soft delete); bearer auth inherited
+✅ Mobile: MemoriesScreen (view / semantic search / delete with confirm /
+   tap-through to source transcript), MemoryApi, psychology-icon entry on
+   voice screen; flutter analyze clean, widget tests pass
+✅ Recall-test harness backend/recall_test.py: edge-tts sessions N ("peacock
+   color") and N+1 ("did I talk about birds?") on DIFFERENT client_session_ids
+   (so replay fallback can't explain a pass), polls /memories until session
+   N's provenance appears, asserts "peacock" in the answer
+✅ Tests: 34 pass (13 new Phase 3: extraction/watermark/dedup/ranking/
+   injection-bounds/null-mode/REST incl. 503 paths)
+❌ Deploy to Cloud Run (needs SIRIOUS_MEMORY=1 added to the env set;
+   recommend --no-cpu-throttling so post-session extraction isn't starved)
+❌ On-device E2E recall test + Memories UI against prod
+```
+
+#### Design decisions worth remembering
+
+- **Extraction reads a handler-provided turn snapshot, not Firestore.**
+  `store.snapshot_turns()` is read synchronously at WS teardown and passed to
+  the memory queue — zero read-after-write races with the Phase 2 writer.
+- **Turn-ID watermark (`memory_meta/{doc}` → extracted_turn_ids), not a
+  count:** a resumed handler's snapshot contains ALL turns of the
+  conversation; a count would wrongly skip the head.
+- **Dedup merges instead of skipping:** repeated mentions grow provenance
+  (multi-session evidence), which later powers "you've mentioned this N times".
+- **Speaker field exists but is null** — single-user first; multi-speaker
+  attribution (Phase 5+) extends provenance without a schema break.
+- **Episodic memories are deliberately over-collected** (even trivia): the
+  product must answer "did we ever talk about X?" for anything discussed.
+  Broad topic categories (birds ← peacock) power the north-star recall.
 
 ### Design principle
 

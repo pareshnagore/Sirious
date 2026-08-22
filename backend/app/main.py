@@ -13,6 +13,7 @@ from google import genai
 from google.genai import types
 
 from .store import get_store
+from .memory import get_memory_store
 
 
 app = FastAPI()
@@ -173,6 +174,42 @@ async def get_session(
     }
 
 
+# ── Memory API (Phase 3) ─────────────────────────────────────────────────────
+
+@app.get("/memories")
+async def list_memories(
+    q: str | None = Query(default=None, description="Optional semantic query; omit for newest-first"),
+    limit: int = Query(default=100, ge=1, le=500),
+    _: None = Depends(require_auth),
+):
+    memory = get_memory_store()
+    try:
+        if q:
+            items = await memory.recall(q, top_k=limit)
+            return {"memories": items, "query": q}
+        return {"memories": await memory.list_memories(limit=limit)}
+    except Exception as e:  # noqa: BLE001
+        log_event("rest", "memories_list_error", error=repr(e))
+        return JSONResponse(status_code=503, content={"detail": "memory store unavailable"})
+
+
+@app.delete("/memories/{memory_id}")
+async def delete_memory(
+    memory_id: str,
+    _: None = Depends(require_auth),
+):
+    memory = get_memory_store()
+    try:
+        deleted = await memory.soft_delete(memory_id)
+    except Exception as e:  # noqa: BLE001
+        log_event("rest", "memory_delete_error", error=repr(e), memory_id=memory_id)
+        return JSONResponse(status_code=503, content={"detail": "memory store unavailable"})
+    if not deleted:
+        raise HTTPException(status_code=404, detail="memory not found")
+    log_event("rest", "memory_deleted", memory_id=memory_id)
+    return {"deleted": True, "id": memory_id}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -232,6 +269,18 @@ async def websocket_endpoint(
                 "transcript_replay",
                 turns_replayed=len(lines),
             )
+
+    # Memory injection (Phase 3): bounded block of durable memories +
+    # episodic index into the system instruction. Best-effort — a memory
+    # problem must never delay or break the voice path.
+    memory = get_memory_store()
+    memory_block = ""
+    try:
+        memory_block = await memory.recall_block()
+        if memory_block:
+            log_event(session_id, "memory_injected", chars=len(memory_block))
+    except Exception as e:  # noqa: BLE001
+        log_event(session_id, "memory_recall_error", error=repr(e))
 
     store.start_session(
         doc_id,
@@ -392,6 +441,7 @@ async def websocket_endpoint(
                     "ALWAYS respond in English, no matter what language the "
                     "user speaks or is detected as speaking."
                     + replay_block
+                    + memory_block
                 ),
 
                 input_audio_transcription=(
@@ -841,6 +891,15 @@ async def websocket_endpoint(
             audio_in_bytes=audio_in_bytes,
             audio_out_bytes=audio_out_bytes,
         )
+
+        # Memory extraction (Phase 3): fire-and-forget request. The handler
+        # snapshots its buffered turns synchronously (all segments of a
+        # resumed conversation included) and hands them to the memory writer,
+        # so extraction never races the Phase 2 Firestore writer.
+        try:
+            memory.request_extraction(doc_id, store.snapshot_turns(doc_id))
+        except Exception as e:  # noqa: BLE001 — never break teardown
+            log_event(session_id, "memory_extract_request_error", error=repr(e))
 
         log_event(
             session_id,

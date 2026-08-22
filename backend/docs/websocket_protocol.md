@@ -642,6 +642,46 @@ best-effort — on failure the session simply starts fresh. Verified live:
 fact stated in conversation 1 → clean stop → brand-new session asked about
 the fact → answered correctly from replay.
 
+### Memory API (Phase 3)
+
+Long-term memory is extracted from every session after it ends (one flash-model
+call per session, embeddings per memory; gated by `SIRIOUS_MEMORY=1`). Memories
+live in the Firestore `memories` collection with provenance
+(`session_ref` + `turn_ids` + date), topics, and entities. At each new WS
+connect a bounded block of memories (top facts/tasks + recent episodic index)
+is injected into `system_instruction`.
+
+#### `GET /memories`
+
+- No query → newest-first list: `{ "memories": [ … ] }`
+- `GET /memories?q=<text>` → semantic search, cosine-ranked hits:
+
+```json
+{
+  "query": "birds",
+  "memories": [
+    {
+      "id": "…",
+      "type": "episodic",
+      "text": "User and assistant discussed peacock colors",
+      "topics": ["birds", "peacocks", "colors"],
+      "entities": [],
+      "score": 0.71,
+      "provenance": [
+        {"session_ref": "recall-peacock-ab12", "started_at": "…", "title": "…"}
+      ]
+    }
+  ]
+}
+```
+
+#### `DELETE /memories/{id}`
+
+Soft-delete (`deleted: true` — the doc remains for audit but never resurfaces).
+Returns `{"deleted": true, "id": "…"}`, or `404` for unknown ids.
+
+Errors: `401` no/ bad token · `503` memory store unavailable.
+
 ---
 
 ## Quick reference

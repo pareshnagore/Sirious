@@ -274,6 +274,20 @@ class SessionStore:
             },
         )
 
+    def snapshot_turns(self, doc_id: str) -> list[dict[str, Any]]:
+        """In-memory snapshot of every turn buffered for this doc (all
+        segments of a resumed conversation included). Read synchronously by
+        the WS handler at teardown — before queued writes are applied — and
+        handed to the memory extractor so IT never races the Phase 2 writer.
+        """
+        turns = self._buffer(doc_id).get("turns", [])
+        return [
+            {"id": t.get("id"),
+             "user_text": t.get("user_text") or "",
+             "assistant_text": t.get("assistant_text") or ""}
+            for t in turns
+        ]
+
     # ── read API (REST endpoints; these DO await) ────────────────────────
 
     async def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -335,6 +349,8 @@ class NullSessionStore:
     def start_session(self, *a: Any, **k: Any) -> None: ...
     def record_turn(self, *a: Any, **k: Any) -> None: ...
     def end_session(self, *a: Any, **k: Any) -> None: ...
+    def snapshot_turns(self, doc_id: str) -> list[dict[str, Any]]:
+        return []
 
     async def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
         return []

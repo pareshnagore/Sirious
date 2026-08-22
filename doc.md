@@ -117,11 +117,18 @@ Full event contract (including protocol v2 fields): see `backend/docs/websocket_
 ```text
 backend/
   app/main.py                  FastAPI WS bridge, turn tracking, structured logs,
-                               session-resumption handle store (protocol v2)
+                               session-resumption handle store (protocol v2),
+                               memory injection at connect + extraction kick at end
+  app/store.py                 Firestore session history (async queue+writer)
+  app/memory.py                Phase 3 memory: extraction, embeddings, dedup,
+                               retrieval, /memories backing (same queue+writer pattern)
   docs/websocket_protocol.md   wire protocol v2 (authoritative)
+  recall_test.py               Phase 3 north-star recall harness (edge-tts E2E)
   requirements.txt             pinned deps (google-genai==2.19.0)
 mobile/
-  lib/services/                controller, WS client, audio capture/playback
+  lib/services/                controller, WS client, audio capture/playback,
+                               history_api, memory_api
+  lib/ui/                      voice session, history, transcript detail, memories
   android/                     Gradle 9.3.1 / AGP 9.1.0 / Kotlin 2.4.0
 product_phases.md              phase plan + live progress (source of truth)
 doc.md                         this file
@@ -137,6 +144,7 @@ Signing keys (`upload-keystore.jks`, `key.properties`) are **gitignored — repo
 * **Phase 1 (done 21 Aug)** — real Flutter Android client: state machine (IDLE→CONNECTING→LISTENING⇄RESPONDING/PLAYING/INTERRUPTING), per-turn transcript aggregation, barge-in flush + on-device measurement, network-blip auto-reconnect with backoff + keepalive stall watchdog, signed release APK, modern build toolchain. Accepted on device.
 * **Protocol v2 bonus (21 Aug, pulled forward from Phase 2)** — session resumption: stable `client_session_id` from the client, server-side handle store (2 h TTL), same-Gemini-session resume on reconnect, `resumed` flag surfaced in UI. Verified end-to-end: fact spoken → socket hard-dropped → reconnect → model still knew the fact. In production.
 * **Phase 2 (done 22 Aug)** — persistent session history: Firestore (native, asia-south1) with one doc per logical conversation (`client_session_id`; resuming reconnects extend the same doc), async queue+writer with turn-level writes and disconnect flush that can never block or break the voice path; REST history API; bearer-token auth on REST + WS handshake; mobile History/Transcript screens with token in `flutter_secure_storage`; transcript-replay fallback (recent turns injected into `system_instruction` when no live resume handle exists). E2E verified on device: spoken question → Gemini → Firestore → REST → phone screen; replay fallback verified live across sessions.
+* **Phase 3 (built 22 Aug, deploy pending)** — contextual memory: after each session ends the backend extracts structured memories (episodic / semantic / entity / task) with one flash-model call over a handler-provided turn snapshot (no read-after-write races), embeds them (`gemini-embedding-001`), dedups by cosine ≥ 0.90 into provenance-growing merges, and stores them in the Firestore `memories` collection with session/turn provenance and a turn-ID watermark per conversation. At every new connect a bounded block (top facts + date-stamped episodic index) is injected into `system_instruction`. `GET /memories?q=` gives conversational semantic search; `DELETE /memories/{id}` soft-deletes. Mobile Memories screen (view/search/delete/tap-through). North-star: peacock-color session N must be recallable as "you talked about peacocks" in session N+1 — harness in `backend/recall_test.py`.
 
 ---
 
@@ -168,7 +176,7 @@ Persistent transcript storage                    ✅ Phase 2 done 22 Aug 2026 (F
 History/search UI                                ✅ Phase 2 (list + transcript detail on device)
 Transcript-replay fallback (resume expired)      ✅ Phase 2 (live-verified 22 Aug)
 Auth                                             ✅ Phase 2 (bearer token, REST + WS)
-Long-term memory                                 ❌ Phase 3
+Long-term memory                                 🟡 Phase 3 built 22 Aug 2026 (deploy + E2E pending)
 Tools / actions                                  ❌ Phase 4+
 ```
 
@@ -187,4 +195,4 @@ Layering principle (unchanged since the start): transport → conversation manag
 
 # 10. One-line status
 
-> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity AND persistent, browsable history in production — Phase 2 closed 22 Aug 2026; next: Phase 3 contextual memory.**
+> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity AND persistent, browsable history in production — Phase 2 closed 22 Aug 2026; Phase 3 contextual memory built and tested locally (deploy + on-device recall test pending).**
