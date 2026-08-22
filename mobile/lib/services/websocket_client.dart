@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../config/app_config.dart';
+import 'auth_service.dart';
 
 typedef JsonEventHandler = void Function(Map<String, dynamic> event);
 typedef BinaryHandler = void Function(Uint8List data);
@@ -43,14 +44,19 @@ class WebSocketClient {
     // Append the stable client_session_id so the backend can resume the same
     // Gemini session across reconnects (protocol v2). Absent → fresh session.
     var target = Uri.parse(_wsUrl);
+    final query = <String, String>{...target.queryParameters};
+
     if (clientSessionId != null && clientSessionId.isNotEmpty) {
-      target = target.replace(
-        queryParameters: {
-          ...target.queryParameters,
-          'client_session_id': clientSessionId,
-        },
-      );
+      query['client_session_id'] = clientSessionId;
     }
+
+    // Phase 2 auth: server rejects the handshake without ?token=...
+    final token = await AuthService().getToken();
+    if (token != null && token.isNotEmpty) {
+      query['token'] = token;
+    }
+
+    target = target.replace(queryParameters: query);
 
     final channel = WebSocketChannel.connect(target);
     _channel = channel;
