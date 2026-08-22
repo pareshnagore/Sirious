@@ -275,10 +275,47 @@ async def websocket_endpoint(
     # problem must never delay or break the voice path.
     memory = get_memory_store()
     memory_block = ""
+    memory_tools = None
     try:
         memory_block = await memory.recall_block()
         if memory_block:
             log_event(session_id, "memory_injected", chars=len(memory_block))
+        # Agentic recall (Phase 3): give the model a lookup tool so questions
+        # about anything OUTSIDE the injected wallet can still be answered
+        # from the full memory store. Declared only when memory is enabled;
+        # execution happens in the receive loop below.
+        if memory.enabled():
+            memory_tools = [
+                types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name="search_past_conversations",
+                            description=(
+                                "Search the user's past conversations and your "
+                                "long-term memories about them. Use whenever the "
+                                "user refers to something not covered by what you "
+                                "already know — past discussions, facts they told "
+                                "you earlier, plans, people, or preferences "
+                                "(e.g. 'did we ever talk about X?', 'what did I "
+                                "say about Y?')."
+                            ),
+                            parameters=types.Schema(
+                                type=types.Type.OBJECT,
+                                properties={
+                                    "query": types.Schema(
+                                        type=types.Type.STRING,
+                                        description=(
+                                            "What to search for, in a few "
+                                            "natural words."
+                                        ),
+                                    ),
+                                },
+                                required=["query"],
+                            ),
+                        ),
+                    ],
+                ),
+            ]
     except Exception as e:  # noqa: BLE001
         log_event(session_id, "memory_recall_error", error=repr(e))
 
@@ -421,6 +458,10 @@ async def websocket_endpoint(
             model=MODEL,
             config=types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
+
+                # Agentic memory recall (Phase 3): search_past_conversations
+                # is available when SIRIOUS_MEMORY=1 (None otherwise).
+                tools=memory_tools,
 
                 # Resume the previous Gemini session when the client
                 # reconnects with a known client_session_id (handle=None
@@ -574,6 +615,99 @@ async def websocket_endpoint(
                     while True:
 
                         async for response in session.receive():
+
+                            # -----------------------------
+                            # Tool calls (agentic memory recall, Phase 3)
+                            # -----------------------------
+
+                            if response.tool_call:
+                                for fc in (response.tool_call.function_calls or []):
+                                    if fc.name == "search_past_conversations":
+                                        query = ""
+                                        args = fc.args or {}
+                                        if isinstance(args, dict):
+                                            query = str(args.get("query") or "")
+                                    else:
+                                        query = None  # unknown tool → skip below
+
+                                    log_event(
+                                        session_id,
+                                        "tool_called",
+                                        tool=fc.name,
+                                        query=query,
+                                    )
+
+                                    hits = []
+                                    if query is None:
+                                        result_payload: dict = {"error": "unknown tool"}
+                                    elif not query.strip():
+                                        result_payload = {
+                                            "result": "no results",
+                                            "note": "empty query",
+                                        }
+                                    else:
+                                        try:
+                                            found = await memory.recall(query, top_k=5)
+                                            hits = found
+                                            result_payload = {
+                                                "result": (
+                                                    "Found these memories about the "
+                                                    "user's past conversations:"
+                                                    if found
+                                                    else "No matching memories found."
+                                                ),
+                                                "memories": [
+                                                    {
+                                                        "text": h.get("text"),
+                                                        "type": h.get("type"),
+                                                        # Similarity score: the
+                                                        # MODEL decides relevance
+                                                        # from this (0.9+ strong,
+                                                        # <0.6 weak/unrelated).
+                                                        "score": h.get("score"),
+                                                        "date": (
+                                                            (h.get("provenance") or [{}])[-1]
+                                                            .get("started_at", "")[:10]
+                                                            or None
+                                                        ),
+                                                        "session_ref": (
+                                                            (h.get("provenance") or [{}])[-1]
+                                                            .get("session_ref")
+                                                        ),
+                                                    }
+                                                    for h in found
+                                                ],
+                                            }
+                                            log_event(
+                                                session_id,
+                                                "tool_result",
+                                                tool=fc.name,
+                                                hits=len(found),
+                                            )
+                                        except Exception as e:  # noqa: BLE001 — degrade gracefully
+                                            log_event(
+                                                session_id,
+                                                "tool_error",
+                                                tool=fc.name,
+                                                error=repr(e),
+                                            )
+                                            result_payload = {
+                                                "error": "memory search temporarily unavailable"
+                                            }
+
+                                    await session.send_tool_response(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fc.name,
+                                                # REQUIRED by Google AI: echo the
+                                                # call id back, else the request
+                                                # 400s inside the Live session.
+                                                id=fc.id,
+                                                response=result_payload,
+                                            )
+                                        ]
+                                    )
+                                continue
 
                             # -----------------------------
                             # Session lifecycle

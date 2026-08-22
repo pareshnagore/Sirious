@@ -155,7 +155,6 @@ async def main() -> None:
     for p in (PCM_N, PCM_N1):
         if not os.path.exists(p):
             tts_to_pcm(Q_PEACOCK if p == PCM_N else Q_BIRDS, p)
-
     async with httpx.AsyncClient(timeout=30) as hc:
         # ── Session N: casual peacock question ────────────────────────────
         print(f"[N] {Q_PEACOCK}", flush=True)
@@ -188,4 +187,5 @@ async def main() -> None:
     sys.exit(0 if ok else 1)
 
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
