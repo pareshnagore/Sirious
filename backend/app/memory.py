@@ -39,7 +39,7 @@ MEMORIES_COLLECTION = "memories"
 META_COLLECTION = "memory_meta"
 SESSIONS_COLLECTION = "sessions"
 
-EXTRACT_MODEL = os.environ.get("SIRIOUS_EXTRACT_MODEL", "gemini-2.5-flash")
+EXTRACT_MODEL = os.environ.get("SIRIOUS_EXTRACT_MODEL", "gemini-3.6-flash")
 EMBED_MODEL = os.environ.get("SIRIOUS_EMBED_MODEL", "gemini-embedding-001")
 EMBED_DIM = int(os.environ.get("SIRIOUS_EMBED_DIM", "768"))
 
