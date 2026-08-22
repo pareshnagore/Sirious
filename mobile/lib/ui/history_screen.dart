@@ -15,6 +15,7 @@ class HistoryScreen extends StatefulWidget {
 
 class _HistoryScreenState extends State<HistoryScreen> {
   final HistoryApi _api = HistoryApi();
+  List<SessionSummary>? _sessions;   // kept locally so deletes can remove rows
   late Future<List<SessionSummary>> _future;
   String? _token;
 
@@ -28,9 +29,57 @@ class _HistoryScreenState extends State<HistoryScreen> {
     setState(() {
       _future = _api.listSessions();
     });
+    _future.then((s) {
+      if (mounted) setState(() => _sessions = s);
+    });
     _token = await AuthService().getToken();
     if (mounted) {
       setState(() {});
+    }
+  }
+
+  Future<void> _confirmDelete(SessionSummary s) async {
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete conversation?'),
+        content: Text(
+          '"${s.title ?? '(no speech captured)'}" will be removed along with '
+          'the memories it came from.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (yes != true) return;
+    try {
+      final stats = await _api.deleteSession(s.id);
+      if (!mounted) return;
+      setState(() {
+        _sessions = (_sessions ?? []).where((x) => x.id != s.id).toList();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Conversation deleted · memories updated ${stats['updated']}, '
+            'removed ${stats['deleted']}',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Delete failed: $e')),
+      );
+      _load();
     }
   }
 
@@ -153,26 +202,38 @@ class _HistoryScreenState extends State<HistoryScreen> {
               separatorBuilder: (_, _) => const Divider(height: 1),
               itemBuilder: (context, i) {
                 final s = sessions[i];
-                return ListTile(
-                  title: Text(
-                    s.title ?? '(no speech captured)',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
+                return Dismissible(
+                  key: ValueKey(s.id),
+                  direction: DismissDirection.endToStart,
+                  background: Container(
+                    color: Theme.of(context).colorScheme.errorContainer,
+                    alignment: Alignment.centerRight,
+                    padding: const EdgeInsets.only(right: 24),
+                    child: Icon(Icons.delete,
+                        color: Theme.of(context).colorScheme.onErrorContainer),
                   ),
-                  subtitle: Text(
-                    [
-                      _fmtDate(s.startedAt),
-                      if (s.durationS != null)
-                        '${s.durationS!.toStringAsFixed(0)}s',
-                      '${s.turnCount ?? 0} turns',
-                    ].join(' · '),
-                  ),
-                  trailing: const Icon(Icons.chevron_right),
-                  onTap: () => Navigator.push(
-                    context,
-                    MaterialPageRoute<void>(
-                      builder: (_) =>
-                          SessionDetailScreen(sessionId: s.id),
+                  confirmDismiss: (_) => _confirmDelete(s).then((_) => false),
+                  child: ListTile(
+                    title: Text(
+                      s.title ?? '(no speech captured)',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(
+                      [
+                        _fmtDate(s.startedAt),
+                        if (s.durationS != null)
+                          '${s.durationS!.toStringAsFixed(0)}s',
+                        '${s.turnCount ?? 0} turns',
+                      ].join(' · '),
+                    ),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => Navigator.push(
+                      context,
+                      MaterialPageRoute<void>(
+                        builder: (_) =>
+                            SessionDetailScreen(sessionId: s.id),
+                      ),
                     ),
                   ),
                 );

@@ -210,6 +210,33 @@ async def delete_memory(
     return {"deleted": True, "id": memory_id}
 
 
+@app.delete("/sessions/{doc_id}")
+async def delete_session(
+    doc_id: str,
+    _: None = Depends(require_auth),
+):
+    """Delete a conversation AND its memory footprint: provenance entries
+    citing it are stripped; memories left sourceless are removed outright."""
+    try:
+        deleted = await get_store().delete_session(doc_id)
+    except Exception as e:  # noqa: BLE001 — report, don't crash
+        log_event("rest", "session_delete_error", error=repr(e), doc_id=doc_id)
+        return JSONResponse(status_code=503, content={"detail": "store unavailable"})
+    if not deleted:
+        raise HTTPException(status_code=404, detail="session not found")
+
+    memory = get_memory_store()
+    try:
+        stats = await memory.strip_provenance(doc_id)
+        await memory.delete_session_meta(doc_id)
+    except Exception as e:  # noqa: BLE001 — session itself is already gone
+        log_event("rest", "memory_cascade_error", error=repr(e), doc_id=doc_id)
+        stats = {"memories_updated": 0, "memories_deleted": 0, "cascade_error": True}
+
+    log_event("rest", "session_deleted", doc_id=doc_id, **stats)
+    return {"deleted": True, "id": doc_id, "memories": stats}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,

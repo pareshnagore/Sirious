@@ -31,14 +31,14 @@ from app import main as main_mod
 # ── Fakes ────────────────────────────────────────────────────────────────────
 
 class _Snap:
-    def __init__(self, id, data):
+    def __init__(self, id, data, ref=None):
         self.id = id
         self._data = data
         self.exists = data is not None
+        self.reference = ref  # real Firestore snapshots carry their doc ref
 
     def to_dict(self):
         return self._data
-
 
 class FakeDocRef:
     def __init__(self, db, coll, doc_id):
@@ -85,7 +85,10 @@ class FakeQuery:
             reverse=self.reverse,
         )[: self._limit]
         for doc_id, data in items:
-            yield _Snap(doc_id, data)
+            yield _Snap(
+                doc_id, data,
+                ref=self.db.collection(self.coll).document(doc_id),
+            )
 
 
 class FakeCollection:
@@ -511,6 +514,55 @@ def test_null_memory_store():
     assert asyncio.run(n.recall_block()) == ""
     assert asyncio.run(n.list_memories()) == []
     assert asyncio.run(n.soft_delete("x")) is False
+
+
+# ── Session deletion + memory cascade ┚─ P3 add-on ─────────────────────────
+
+def test_strip_provenance_updates_and_orphans_die(make_memory):
+    """Memory cited by 2 sessions survives a delete with provenance stripped;
+    memory cited only by the deleted session is removed outright."""
+    factory, _, _ = make_memory
+    s, db, _ = factory()
+
+    async def seed():
+        coll = db.docs.setdefault("memories", {})
+        coll["m-shared"] = {
+            "deleted": False, "created_ms": 1,
+            "text": "discussed peacocks",
+            "provenance": [
+                {"session_ref": "s-A", "turn_ids": ["t1"]},
+                {"session_ref": "s-B", "turn_ids": ["t9"]},
+            ],
+        }
+        coll["m-orphan"] = {
+            "deleted": False, "created_ms": 2,
+            "text": "only in A",
+            "provenance": [{"session_ref": "s-A", "turn_ids": ["t2"]}],
+        }
+        coll["m-unrelated"] = {
+            "deleted": False, "created_ms": 3,
+            "text": "other topic",
+            "provenance": [{"session_ref": "s-C", "turn_ids": ["t3"]}],
+        }
+
+    async def main():
+        await seed()
+        stats = await s.strip_provenance("s-A")
+        await s.delete_session_meta("s-A")
+
+    asyncio.run(main())
+
+    mems = db.docs["memories"]
+    assert [p["session_ref"] for p in mems["m-shared"]["provenance"]] == ["s-B"]
+    assert "m-orphan" not in mems          # sourceless → hard-deleted
+    assert "m-unrelated" in mems           # untouched
+
+
+def test_null_stores_cascade_noops():
+    n = NullMemoryStore()
+    assert asyncio.run(n.strip_provenance("x")) == {
+        "memories_updated": 0, "memories_deleted": 0
+    }
 
 
 # ── REST API ─────────────────────────────────────────────────────────────────

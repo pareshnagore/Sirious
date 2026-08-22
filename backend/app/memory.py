@@ -452,6 +452,7 @@ class MemoryStore:
                 "topics": c.get("topics") or [],
                 "entities": c.get("entities") or [],
                 "score": round(s, 4),
+                "times_seen": c.get("times_seen", 1),
                 "provenance": (c.get("provenance") or [])[-3:],
             }
             for s, c in scored[:top_k]
@@ -520,6 +521,48 @@ class MemoryStore:
         )
         return True
 
+    async def strip_provenance(self, session_ref: str) -> dict[str, int]:
+        """Remove every provenance entry citing ``session_ref``.
+
+        Memories that still have other sources survive (dedup merges mean one
+        memory may cite several conversations); memories left with NO sources
+        are hard-deleted — the user deleted the conversation, so its notes
+        must not outlive it. Call ``delete_session_meta`` too, for the
+        extraction watermark.
+        """
+        db = self._ensure_db()
+        updated = 0
+        deleted = 0
+        async for s in (
+            db.collection(MEMORIES_COLLECTION)
+            .order_by("created_ms", direction="DESCENDING")
+            .limit(MAX_ACTIVE_MEMORIES)
+            .stream()
+        ):
+            d = s.to_dict() or {}
+            prov = d.get("provenance") or []
+            kept = [p for p in prov if p.get("session_ref") != session_ref]
+            if len(kept) == len(prov):
+                continue  # doesn't cite this session at all
+            if kept:
+                await s.reference.set({"provenance": kept}, merge=True)
+                updated += 1
+            else:
+                # No sources left → delete outright (hard delete: this note's
+                # only evidence was the conversation being erased).
+                await s.reference.delete()
+                deleted += 1
+        log.info(
+            "strip_provenance session=%s updated=%d deleted=%d",
+            session_ref, updated, deleted,
+        )
+        return {"memories_updated": updated, "memories_deleted": deleted}
+
+    async def delete_session_meta(self, doc_id: str) -> None:
+        """Drop the extraction watermark for a deleted conversation."""
+        db = self._ensure_db()
+        await db.collection(META_COLLECTION).document(doc_id).delete()
+
 
 MAX_TITLE_CHARS_MEM = 80
 
@@ -556,6 +599,11 @@ class NullMemoryStore:
 
     async def soft_delete(self, memory_id: str) -> bool:
         return False
+
+    async def strip_provenance(self, session_ref: str) -> dict[str, int]:
+        return {"memories_updated": 0, "memories_deleted": 0}
+
+    async def delete_session_meta(self, doc_id: str) -> None: ...
 
 
 _store: MemoryStore | NullMemoryStore | None = None

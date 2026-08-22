@@ -62,6 +62,29 @@ class HistoryApi {
     return SessionDetail.fromJson(
         jsonDecode(resp.body) as Map<String, dynamic>);
   }
+
+  /// Deletes a conversation AND its memory footprint server-side
+  /// (provenance stripped; sourceless memories removed). Returns the
+  /// memory-cascade stats for display: {updated, deleted}.
+  Future<Map<String, int>> deleteSession(String id) async {
+    final uri = Uri.parse('${AppConfig.apiBase}/sessions/$id');
+    final resp = await _client.delete(uri, headers: await _headers());
+    if (resp.statusCode == 401) {
+      throw HistoryAuthException();
+    }
+    if (resp.statusCode == 404) {
+      throw HistoryNotFoundException(id);
+    }
+    if (resp.statusCode != 200) {
+      throw HistoryApiException('delete failed: HTTP ${resp.statusCode}');
+    }
+    final body = jsonDecode(resp.body) as Map<String, dynamic>;
+    final m = (body['memories'] as Map<String, dynamic>? ?? const {});
+    return {
+      'updated': (m['memories_updated'] ?? 0) as int,
+      'deleted': (m['memories_deleted'] ?? 0) as int,
+    };
+  }
 }
 
 class HistoryApiException implements Exception {

@@ -288,6 +288,17 @@ class SessionStore:
             for t in turns
         ]
 
+    async def delete_session(self, doc_id: str) -> bool:
+        """Hard-delete a conversation document. Returns False if absent."""
+        db = self._ensure_db()
+        ref = db.collection(SESSIONS_COLLECTION).document(doc_id)
+        snap = await ref.get()
+        if not snap.exists:
+            return False
+        await ref.delete()
+        self._buffers.pop(doc_id, None)
+        return True
+
     # ── read API (REST endpoints; these DO await) ────────────────────────
 
     async def list_sessions(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -362,6 +373,9 @@ class NullSessionStore:
         self, doc_id: str, limit: int = 12
     ) -> list[dict[str, str]]:
         return []
+
+    async def delete_session(self, doc_id: str) -> bool:
+        return False
 
 
 _store: SessionStore | None = None
