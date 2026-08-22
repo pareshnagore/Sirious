@@ -264,9 +264,11 @@ Conversations are **saved and searchable**. User can revisit what was said and b
 
 ### User experience
 
-- After a session, user sees a transcript timeline
-- Can search past sessions ("what did we discuss about Mumbai?")
-- Can start a new session with optional reference to past context
+- ✅ After a session, user sees a transcript timeline — **delivered** (History list → transcript detail, verified on device)
+- ➡️ ~~Can search past sessions ("what did we discuss about Mumbai?")~~ — **moved to Phase 3**: a raw substring search would be a stopgap that memory-based retrieval immediately supersedes; building it once, on top of extracted memory
+- 🟡 Can start a new session with optional reference to past context — **partially delivered, explicitly to Phase 3**: the replay fallback already injects past turns into Gemini, but only for reconnects of the *same* session id (invisible to the user). The deliberate "ask about / continue a past conversation" UX is Phase 3's retrieval-at-session-start scope
+
+> Phase 2 is complete against its committed scope ("In:" list + success criteria below). The two UX bullets above were aspirational vision text; they are tracked as Phase 3 work now, not silently dropped.
 
 ### Progress (22 Aug 2026)
 
@@ -315,7 +317,7 @@ Conversations are **saved and searchable**. User can revisit what was said and b
 
 ---
 
-## Phase 3 — Contextual memory (LATER)
+## Phase 3 — Contextual memory (NEXT)
 
 ### Goal
 
@@ -329,6 +331,21 @@ Week 2: "What should I prepare for my interview?"
 Sirious:  "For your Acme interview on Tuesday, you might..."
 ```
 
+**North-star recall test (Paresh's objective, agreed 22 Aug 2026):**
+
+```text
+Session N:   "What is the color of a peacock?"        (casual conversation)
+Session N+1: "Did I have any conversation about birds?"
+Sirious:     "Yes — you talked about peacocks and asked their color."
+```
+
+The assistant must recall **the act of talking about something** ("did we
+discuss X?"), not just answer questions from facts. Single user first; the
+same memory must later attach to *who said what* so multi-speaker sessions
+("someone said something about…") keep that context. This drives the design:
+memories need provenance (session/turn/speaker refs), and retrieval must match
+topics, not just keywords.
+
 ### Scope
 
 **In:**
@@ -338,11 +355,17 @@ Sirious:  "For your Acme interview on Tuesday, you might..."
   turn summaries → episodic store → extraction job → structured memory
   ```
 - Memory types:
-  - **Episodic:** session/turn references
+  - **Episodic:** session/turn references (provenance — "you discussed this in session on 22 Aug")
   - **Semantic facts:** preferences, dates, project details
-  - **Entities:** people, companies, projects (names only at first)
+  - **Entities:** people, companies, projects, topics (names only at first) — topics power the "birds → peacock" recall
   - **Tasks:** action items mentioned in conversation
 - Retrieval at session start (inject relevant memory into Gemini system context)
+- **Conversational search over past sessions** (moved here from Phase 2):
+  "what did we discuss about Mumbai?" answered from extracted memory +
+  transcript references — not raw substring grep, which Phase 3 supersedes
+- **Explicit past-context UX** (moved here from Phase 2): start/reference a
+  past session deliberately; generalizes the Phase 2 replay fallback beyond
+  same-session reconnects
 - User controls: view memory, delete incorrect entries
 - "Silent assistant" behavior tuning via system instructions
 
@@ -355,6 +378,7 @@ Sirious:  "For your Acme interview on Tuesday, you might..."
 ### Success criteria
 
 - [ ] Facts mentioned in session N are usable in session N+1 without user re-stating them
+- [ ] **Recall test:** "Did I have any conversation about birds?" after an earlier peacock-color session → "Yes — you talked about peacocks and asked their color" (topic-level episodic recall with provenance)
 - [ ] User can see and delete stored memories
 - [ ] Memory injection does not blow context window or add unacceptable latency
 
