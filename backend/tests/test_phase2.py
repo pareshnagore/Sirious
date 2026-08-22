@@ -256,8 +256,41 @@ def test_null_store():
     async def fetch():
         assert await n.list_sessions() == []
         assert await n.get_session("x") is None
+        assert await n.replay_turns("x") == []
 
     asyncio.run(fetch())
+
+
+def test_replay_turns_order_and_limit(make_store):
+    factory, db = make_store
+    s = factory()
+
+    async def main():
+        s.start_session("cs-9", client_session_id="cs-9", model="m",
+                        resumed=False, device=None, now_iso="now")
+        for i in range(15):
+            s.record_turn(
+                "cs-9",
+                summary={
+                    "turn_id": f"t{i}",
+                    "started_at": "now",
+                    "ended_at": "now",
+                    "reason": "turn_complete",
+                    "user_text": f"question {i}",
+                    "assistant_text": f"answer {i}",
+                },
+                now_iso="now",
+            )
+        await _drain(s)
+
+    asyncio.run(main())
+    replay = asyncio.run(s.replay_turns("cs-9", limit=12))
+    assert len(replay) == 12
+    # Oldest→newest within the window: last item is the newest turn.
+    assert replay[-1]["user_text"] == "question 14"
+    assert replay[0]["user_text"] == "question 3"
+    # Empty doc / no store → empty list (NullSessionStore covered above).
+    assert asyncio.run(s.replay_turns("missing-doc")) == []
 
 
 # ── Auth + REST ─────────────────────────────────────────────────────────────

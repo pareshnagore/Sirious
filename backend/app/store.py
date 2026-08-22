@@ -311,6 +311,23 @@ class SessionStore:
             return None
         return snap.to_dict()
 
+    async def replay_turns(
+        self, doc_id: str, limit: int = 12
+    ) -> list[dict[str, str]]:
+        """Most recent turns (oldest→newest) for resume-context replay."""
+        doc = await self.get_session(doc_id)
+        if not doc:
+            return []
+        turns = doc.get("turns") or []
+        return [
+            {
+                "user_text": t.get("user_text") or "",
+                "assistant_text": t.get("assistant_text") or "",
+            }
+            for t in turns[-limit:]
+            if (t.get("user_text") or t.get("assistant_text"))
+        ]
+
 
 class NullSessionStore:
     """No-op stand-in used when SIRIOUS_PERSIST != "1"."""
@@ -324,6 +341,11 @@ class NullSessionStore:
 
     async def get_session(self, doc_id: str) -> None:
         return None
+
+    async def replay_turns(
+        self, doc_id: str, limit: int = 12
+    ) -> list[dict[str, str]]:
+        return []
 
 
 _store: SessionStore | None = None

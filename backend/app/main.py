@@ -202,6 +202,37 @@ async def websocket_endpoint(
     # document rather than creating a new one.
     store = get_store()
     doc_id = client_session_id or session_id
+
+    # Transcript-replay fallback (Phase 2): when there is NO live resumption
+    # handle (fresh conversation, expired handle, recycled instance) but this
+    # client_session_id has past turns in Firestore, inject them into the
+    # system instruction so the model keeps conversational memory. This is
+    # awaited BEFORE the Gemini connect, so it never touches the audio path.
+    replay_block = ""
+    if not resumed and client_session_id:
+        try:
+            replay_turns = await store.replay_turns(doc_id)
+        except Exception as e:  # noqa: BLE001 — replay is best-effort
+            log_event(session_id, "replay_fetch_error", error=repr(e))
+            replay_turns = []
+        if replay_turns:
+            lines = [
+                f"User said: {t['user_text']}\nYou replied: {t['assistant_text']}"
+                for t in replay_turns
+                if t["user_text"] or t["assistant_text"]
+            ]
+            replay_block = (
+                "\n\nThe following is a transcript of your previous "
+                "conversation with this user (most recent last). Treat it as "
+                "things you already discussed with them; do not repeat or "
+                "re-introduce yourself:\n\n" + "\n\n".join(lines)
+            )
+            log_event(
+                session_id,
+                "transcript_replay",
+                turns_replayed=len(lines),
+            )
+
     store.start_session(
         doc_id,
         client_session_id=client_session_id,
@@ -360,6 +391,7 @@ async def websocket_endpoint(
                     "You are Sirious, a helpful and concise voice assistant. "
                     "ALWAYS respond in English, no matter what language the "
                     "user speaks or is detected as speaking."
+                    + replay_block
                 ),
 
                 input_audio_transcription=(
