@@ -14,6 +14,7 @@ from google.genai import types
 
 from .store import get_store
 from .memory import get_memory_store
+from .tools import build_registry
 
 
 app = FastAPI()
@@ -302,49 +303,30 @@ async def websocket_endpoint(
     # problem must never delay or break the voice path.
     memory = get_memory_store()
     memory_block = ""
-    memory_tools = None
     try:
         memory_block = await memory.recall_block()
         if memory_block:
             log_event(session_id, "memory_injected", chars=len(memory_block))
-        # Agentic recall (Phase 3): give the model a lookup tool so questions
-        # about anything OUTSIDE the injected wallet can still be answered
-        # from the full memory store. Declared only when memory is enabled;
-        # execution happens in the receive loop below.
-        if memory.enabled():
-            memory_tools = [
-                types.Tool(
-                    function_declarations=[
-                        types.FunctionDeclaration(
-                            name="search_past_conversations",
-                            description=(
-                                "Search the user's past conversations and your "
-                                "long-term memories about them. Use whenever the "
-                                "user refers to something not covered by what you "
-                                "already know — past discussions, facts they told "
-                                "you earlier, plans, people, or preferences "
-                                "(e.g. 'did we ever talk about X?', 'what did I "
-                                "say about Y?')."
-                            ),
-                            parameters=types.Schema(
-                                type=types.Type.OBJECT,
-                                properties={
-                                    "query": types.Schema(
-                                        type=types.Type.STRING,
-                                        description=(
-                                            "What to search for, in a few "
-                                            "natural words."
-                                        ),
-                                    ),
-                                },
-                                required=["query"],
-                            ),
-                        ),
-                    ],
-                ),
-            ]
     except Exception as e:  # noqa: BLE001
         log_event(session_id, "memory_recall_error", error=repr(e))
+
+    # Tool registry (Phase 4): every function-calling tool — Phase 3's
+    # agentic recall AND Phase 4's actions (web_search, add_note) — is
+    # declared by app/tools.py per connection and executed through ONE
+    # dispatcher in the receive loop below, with an audit record per call.
+    # Best-effort: a registry problem must never delay or break the voice path.
+    try:
+        registry, audit_log = build_registry(
+            session_id=session_id,
+            doc_id=doc_id,
+            memory=memory,
+        )
+        tool_declarations = registry.genai_tool()
+        if tool_declarations is not None:
+            log_event(session_id, "tools_registered", tools=registry.names())
+    except Exception as e:  # noqa: BLE001
+        log_event(session_id, "tools_registry_error", error=repr(e))
+        registry, audit_log, tool_declarations = None, None, None
 
     store.start_session(
         doc_id,
@@ -486,9 +468,10 @@ async def websocket_endpoint(
             config=types.LiveConnectConfig(
                 response_modalities=["AUDIO"],
 
-                # Agentic memory recall (Phase 3): search_past_conversations
-                # is available when SIRIOUS_MEMORY=1 (None otherwise).
-                tools=memory_tools,
+                # Function calling (Phase 3 + Phase 4): all registered tools
+                # (search_past_conversations, web_search, add_note …) come
+                # from the per-connection registry; None when none registered.
+                tools=tool_declarations,
 
                 # Resume the previous Gemini session when the client
                 # reconnects with a known client_session_id (handle=None
@@ -644,83 +627,61 @@ async def websocket_endpoint(
                         async for response in session.receive():
 
                             # -----------------------------
-                            # Tool calls (agentic memory recall, Phase 3)
+                            # Tool calls (Phase 3 recall + Phase 4 actions)
                             # -----------------------------
 
                             if response.tool_call:
-                                for fc in (response.tool_call.function_calls or []):
-                                    if fc.name == "search_past_conversations":
-                                        query = ""
-                                        args = fc.args or {}
-                                        if isinstance(args, dict):
-                                            query = str(args.get("query") or "")
-                                    else:
-                                        query = None  # unknown tool → skip below
+
+                                for fc in (
+                                    response.tool_call.function_calls
+                                    or []
+                                ):
+
+                                    args = fc.args if isinstance(
+                                        fc.args, dict
+                                    ) else {}
 
                                     log_event(
                                         session_id,
                                         "tool_called",
                                         tool=fc.name,
-                                        query=query,
+                                        args={
+                                            k: (v if len(str(v)) <= 200 else str(v)[:200] + "…")
+                                            for k, v in args.items()
+                                        },
                                     )
 
-                                    hits = []
-                                    if query is None:
-                                        result_payload: dict = {"error": "unknown tool"}
-                                    elif not query.strip():
+                                    try:
+                                        result_payload = await registry.dispatch(
+                                            fc.name,
+                                            args,
+                                        )
+                                        log_event(
+                                            session_id,
+                                            "tool_result",
+                                            tool=fc.name,
+                                            outcome=(
+                                                "error"
+                                                if isinstance(result_payload, dict)
+                                                and result_payload.get("error")
+                                                else "ok"
+                                            ),
+                                            error=(
+                                                result_payload.get("error")
+                                                if isinstance(result_payload, dict) and result_payload.get("error")
+                                                else None
+                                            ),
+                                        )
+                                    except Exception as e:  # noqa: BLE001 — belt & braces; dispatch already degrades
+                                        log_event(
+                                            session_id,
+                                            "tool_error",
+                                            tool=fc.name,
+                                            error=repr(e),
+                                        )
                                         result_payload = {
-                                            "result": "no results",
-                                            "note": "empty query",
+                                            "error": "tool execution failed"
                                         }
-                                    else:
-                                        try:
-                                            found = await memory.recall(query, top_k=5)
-                                            hits = found
-                                            result_payload = {
-                                                "result": (
-                                                    "Found these memories about the "
-                                                    "user's past conversations:"
-                                                    if found
-                                                    else "No matching memories found."
-                                                ),
-                                                "memories": [
-                                                    {
-                                                        "text": h.get("text"),
-                                                        "type": h.get("type"),
-                                                        # Similarity score: the
-                                                        # MODEL decides relevance
-                                                        # from this (0.9+ strong,
-                                                        # <0.6 weak/unrelated).
-                                                        "score": h.get("score"),
-                                                        "date": (
-                                                            (h.get("provenance") or [{}])[-1]
-                                                            .get("started_at", "")[:10]
-                                                            or None
-                                                        ),
-                                                        "session_ref": (
-                                                            (h.get("provenance") or [{}])[-1]
-                                                            .get("session_ref")
-                                                        ),
-                                                    }
-                                                    for h in found
-                                                ],
-                                            }
-                                            log_event(
-                                                session_id,
-                                                "tool_result",
-                                                tool=fc.name,
-                                                hits=len(found),
-                                            )
-                                        except Exception as e:  # noqa: BLE001 — degrade gracefully
-                                            log_event(
-                                                session_id,
-                                                "tool_error",
-                                                tool=fc.name,
-                                                error=repr(e),
-                                            )
-                                            result_payload = {
-                                                "error": "memory search temporarily unavailable"
-                                            }
 
                                     await session.send_tool_response(
                                         function_responses=[
