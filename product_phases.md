@@ -74,7 +74,7 @@ Product phases span multiple layers. A single product phase may complete parts o
 ❌ Reminders (FCM + Cloud Tasks — direction agreed), multi-speaker, vision
 ```
 
-**Active focus:** Phase 4 v1 (registry + web_search + add_note + audit) deployed 23 Aug 2026 (rev 00030) and live-verified. Remaining in Phase 4: Paresh's on-device voice verification; then reminders (FCM + Cloud Tasks, direction agreed 23 Aug).
+**Active focus:** Phase 4 v1 (registry + web_search + add_note + audit) deployed 23 Aug 2026 (rev 00030) and live-verified. Reminders chunk 1 (get_current_time / create / confirm / cancel tools, server-side NL time resolution — no prompt timestamps, gated SIRIOUS_REMINDERS) built and tested locally 23 Aug — not deployed. Remaining in Phase 4: deploy chunk 1; then reminders chunks 2–4 (Cloud Tasks + fire endpoint → FCM push + token registration → Android client).
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -536,6 +536,41 @@ Sirious: [ searches, summarizes verbally ]
 ❌ Paresh's on-device voice verification of both tools
 ❌ Reminders — direction AGREED 23 Aug: FCM push + Cloud Tasks one-shot
    scheduling (no polling). Deferred out of v1 deliberately.
+```
+
+#### Reminders — chunk 1 built locally (23 Aug 2026, NOT yet deployed)
+
+```text
+✅ tools.py: ReminderStore (Firestore `reminders/{id}`: text ≤500 chars,
+   due_ts/due_at UTC, topic, status, session_ref) + InMemoryReminderStore
+   null-mode double. Tools behind SIRIOUS_REMINDERS=1 gate (stacks on
+   SIRIOUS_TOOLS; Firestore store requires SIRIOUS_PERSIST):
+   - get_current_time: server clock in SIRIOUS_TZ (default Asia/Kolkata).
+   - create_reminder(text, due_at): writes status="draft", returns
+     draft_id; NOTHING scheduled yet. Validation ≥2 min future, ≤365 days.
+     due_at takes the USER'S OWN WORDS ("friday morning", "in 20 minutes")
+     resolved SERVER-SIDE by a closed-grammar resolver — in N
+     min/hours/days/weeks · today/tonight/tomorrow/day after tomorrow ·
+     [next] <weekday> · H[:MM] [am|pm] · period defaults (morning 9:00,
+     evening 19:00, night 21:00) · ISO 8601 still accepted; naive stamps
+     read as user-local wall clock. Spoken draft-back rendered in user tz.
+   - confirm_reminder(reminder_id): draft→scheduled. Idempotent on
+     re-confirm; stale drafts (>15 min DRAFT_TTL_S) fail closed. This IS
+     the user-consent step (requires_confirmation stays unused).
+   - cancel_reminder(reminder_id): cancelled (fired/cancelled are no-ops).
+✅ main.py: NO date/time in system_instruction (a per-session timestamp
+   would churn the prompt prefix on every reconnect and go stale on
+   long/resumed sessions — Paresh's catch). Temporal grounding lives in
+   get_current_time instead; prompt prefix stays byte-stable.
+✅ requirements.txt: +tzdata (Windows zoneinfo needs it; no-op on Linux).
+✅ Tests: 95 pass (37 new since v1: parse matrix incl. min-lead boundary,
+   NL resolver anchored at fixed NOW = Fri 15 Jan 2027 10:00 IST, lifecycle,
+   idempotent confirm, stale-draft fail-closed, Firestore roundtrip via
+   FakeDb, gating, store-selection by config, audited dispatch flow, and
+   a regression guard asserting system_instruction carries NO timestamp).
+⚠️ By design in chunk 1: confirm flips status only — no Cloud Tasks task
+   is scheduled yet, nothing can fire. Chunks 2–4: Cloud Tasks + fire
+   endpoint; Firebase Admin push + token registration; Android FCM client.
 ```
 
 #### Deployment notes (learned the hard way)

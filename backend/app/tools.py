@@ -30,18 +30,28 @@ import asyncio
 import collections
 import logging
 import os
+import re
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger("sirious.tools")
 
 NOTES_COLLECTION = "tool_notes"
 AUDIT_COLLECTION = "tool_audit"
+REMINDERS_COLLECTION = "reminders"
 MAX_NOTE_CHARS = 4000
 MAX_SNIPPET_CHARS = 350
 MAX_AUDIT_ARG_CHARS = 500
+# Reminders: a draft is only a proposal until confirm_reminder schedules it.
+# Drafts expire so abandoned drafts never pile up as schedulable state.
+DRAFT_TTL_S = 15 * 60               # unconfirmed draft → stale after 15 min
+MAX_REMINDER_TEXT_CHARS = 500
+MIN_LEAD_S = 120                    # must fire ≥ 2 min from now (voice UX)
+MAX_HORIZON_DAYS = 365              # sanity cap on how far out a reminder may be
 
 
 def _truncate(text: Any, limit: int) -> str | None:
@@ -247,6 +257,435 @@ class InMemoryNotesStore(NotesStore):
         return note_id
 
 
+# ── Reminders ────────────────────────────────────────────────────────────────
+
+def _validate_window(ts: float, *, now_s: float) -> tuple[float | None, str | None]:
+    """Shared sanity window: ≥ MIN_LEAD_S ahead, ≤ MAX_HORIZON_DAYS out."""
+    if ts < now_s + MIN_LEAD_S:
+        return None, (
+            "due_at must be at least "
+            f"{MIN_LEAD_S // 60} minutes in the future"
+        )
+    if ts > now_s + MAX_HORIZON_DAYS * 86400:
+        return None, f"due_at is more than {MAX_HORIZON_DAYS} days away"
+    return ts, None
+
+
+def _parse_due_at(raw: Any, *, now_s: float) -> tuple[float | None, str | None]:
+    """Parse an ISO-8601 ``due_at`` into a UTC unix timestamp.
+
+    Accepts explicit offsets ("2026-08-28T09:00:00+05:30"), Z suffix, and
+    naive stamps (interpreted in the USER'S timezone — see _user_tz — since
+    an offset-less time most plausibly means the user's local wall clock).
+    Returns (ts, error); unparsable input yields "could not parse …" so the
+    caller can fall back to natural-language resolution.
+    """
+    if not raw:
+        return None, "empty due_at"
+    try:
+        dt = datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None, (
+            f"could not parse due_at '{raw}' — use ISO 8601 like "
+            f"2026-08-28T09:00:00+05:30"
+        )
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_user_tz())
+    return _validate_window(dt.timestamp(), now_s=now_s)
+
+
+# ── Natural-language "when" resolution ───────────────────────────────────────
+#
+# The model passes the USER'S OWN PHRASING ("friday morning", "in 20
+# minutes"); the server — not the model — knows the current time and
+# timezone. This keeps temporal knowledge out of system_instruction
+# (stable prompt prefix across reconnects, no stale-clock sessions).
+
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+_PERIOD_TIMES = {          # bare period word → default clock time
+    "morning": (9, 0), "afternoon": (15, 0),
+    "evening": (19, 0), "night": (21, 0),
+}
+_WORD_NUMBERS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+    "ten": 10, "eleven": 11, "twelve": 12,
+}
+_WHEN_EXAMPLES = (
+    "'in 20 minutes', 'tomorrow 9 am', 'friday morning', "
+    "'next monday 2 pm', 'tonight', 'day after tomorrow at 5 pm'"
+)
+
+_DAY_RE = re.compile(
+    r"(?P<next>next\s+)?\b(today|tonight|tomorrow|day\s+after\s+tomorrow|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+)
+_CLOCK_RE = re.compile(
+    r"(?:\bat\s+)?\b(?P<h>\d{1,2})(?::(?P<mi>\d{2}))?\s*"
+    r"(?P<ap>a\.?m\.?|p\.?m\.?)?(?![\d:])"
+)
+_PERIOD_RE = re.compile(r"\b(morning|afternoon|evening|night)\b")
+_RELATIVE_RE = re.compile(
+    r"in\s+(?P<n>a|an|\d+|[a-z]+)\s*"
+    r"(?P<unit>minutes?|mins?|hours?|hrs?|days?|weeks?)\b"
+)
+
+
+def _user_tz():
+    """The user's timezone (SIRIOUS_TZ, default Asia/Kolkata). Every user-
+    facing time phrase resolves against this, never the server's clock zone."""
+    return ZoneInfo(os.environ.get("SIRIOUS_TZ", "Asia/Kolkata"))
+
+
+def _resolve_when(text: Any, *, now_s: float) -> tuple[Any | None, str | None]:
+    """Resolve plain-English ``when`` against the user's timezone.
+
+    Closed grammar (promised verbatim in the tool description):
+      in N minutes|hours|days|weeks · today/tonight/tomorrow/
+      day after tomorrow · [next] <weekday> · H[:MM] [am|pm] ·
+      noon implied by period words morning/afternoon/evening/night.
+    Returns (aware UTC datetime | None, error | None). Errors enumerate the
+    supported forms so the model can re-ask the user conversationally.
+    """
+    s = " ".join(str(text or "").strip().lower().split())
+    if not s:
+        return None, "empty due_at"
+    now = datetime.fromtimestamp(now_s, tz=_user_tz())
+
+    # 1) Pure relative duration: "in 20 minutes", "in five hours".
+    m_rel = _RELATIVE_RE.search(s)
+    if m_rel and m_rel.group(0) and s.split()[0] in ("in",):
+        n = _WORD_NUMBERS.get(m_rel.group("n"))
+        if n is None:
+            try:
+                n = int(m_rel.group("n"))
+            except ValueError:
+                return None, (
+                    f"couldn't understand '{m_rel.group('n')}' in '{s}' — "
+                    f"use {_WHEN_EXAMPLES}"
+                )
+        unit = m_rel.group("unit")
+        if unit.startswith(("min",)):
+            delta = timedelta(minutes=n)
+        elif unit.startswith(("h",)):
+            delta = timedelta(hours=n)
+        elif unit.startswith("d"):
+            delta = timedelta(days=n)
+        else:
+            delta = timedelta(weeks=n)
+        return now + delta, None
+
+    # 2) Day reference.
+    day_offset = 0
+    had_day_token = False
+    weekday_plain = False
+    m_day = _DAY_RE.search(s)
+    if m_day:
+        had_day_token = True
+        word = m_day.group(2)
+        if word == "today":
+            day_offset = 0
+        elif word == "tonight":
+            day_offset = 0
+        elif word == "tomorrow":
+            day_offset = 1
+        elif word.startswith("day"):
+            day_offset = 2
+        else:
+            ahead = (_WEEKDAYS[word] - now.weekday()) % 7
+            if m_day.group("next"):
+                ahead += 7                      # "next friday" ≠ this friday
+            else:
+                weekday_plain = True
+            day_offset = ahead
+
+    # 3) Explicit clock time (H[:MM] [am|pm]) — first plausible match.
+    hour = minute = None
+    m_clock = _CLOCK_RE.search(s)
+    if m_clock:
+        h = int(m_clock.group("h"))
+        mi = int(m_clock.group("mi") or 0)
+        ap = m_clock.group("ap")
+        if ap:
+            ap = ap.replace(".", "")
+            if ap == "am":
+                h = 0 if h == 12 else h
+            else:
+                h = 12 if h == 12 else h + 12
+        elif h <= 12:
+            m_period_here = _PERIOD_RE.search(s)
+            if m_period_here and m_period_here.group(1) != "morning" and h <= 11:
+                h += 12                          # "5 evening" → 17:00
+        if not (0 <= h <= 23 and 0 <= mi <= 59):
+            return None, (
+                f"clock time '{m_clock.group(0).strip()}' in '{s}' is out of "
+                f"range — use {_WHEN_EXAMPLES}"
+            )
+        hour, minute = h, mi
+
+    # 4) Defaults when no explicit clock time.
+    m_period = _PERIOD_RE.search(s)
+    if hour is None:
+        if m_period:
+            hour, minute = _PERIOD_TIMES[m_period.group(1)]
+        elif s.startswith("tonight"):
+            hour, minute = (21, 0)
+        elif had_day_token:
+            hour, minute = (9, 0)               # bare day → 09:00 (v1 default)
+        else:
+            return None, (
+                f"could not understand when '{s}' is — use ISO 8601 "
+                f"(e.g. 2026-08-28T09:00:00+05:30) or simple English like "
+                f"{_WHEN_EXAMPLES}"
+            )
+
+    base = (now + timedelta(days=day_offset)).date()
+    dt = datetime(
+        base.year, base.month, base.day, hour, minute, tzinfo=now.tzinfo,
+    )
+
+    # Forgiving bumps BEFORE the strict window check: a bare weekday or
+    # clock time that already passed rolls forward instead of erroring.
+    if dt <= now:
+        if not had_day_token:
+            dt += timedelta(days=1)             # "at 5pm" said at 6pm → tomorrow
+        elif weekday_plain:
+            dt += timedelta(days=7)             # "friday" said friday night
+
+    return dt.astimezone(timezone.utc), None
+
+
+def _resolve_due(raw: Any, *, now_s: float) -> tuple[float | None, str | None]:
+    """Single entry point used by the create handler: ISO first, then the
+    natural-language grammar. Out-of-range ISO errors surface as-is (an
+    explicit wrong date shouldn't be silently reinterpreted)."""
+    ts, err = _parse_due_at(raw, now_s=now_s)
+    if ts is not None:
+        return ts, None
+    if err and "could not parse" not in err and err != "empty due_at":
+        return None, err
+    dt, nl_err = _resolve_when(raw, now_s=now_s)
+    if nl_err is not None:
+        return None, nl_err
+    return _validate_window(dt.timestamp(), now_s=now_s)
+
+
+class ReminderStore:
+    """Reminders in Firestore.
+
+    Lifecycle: create_reminder writes status="draft"; confirm_reminder flips
+    it to "scheduled" (chunk 2 attaches Cloud Tasks there); cancel_reminder
+    sets "cancelled". The fire endpoint (chunk 2) transitions scheduled → fired.
+    Direct awaits are fine here — same reasoning as NotesStore: tool execution
+    sits outside the audio hot path.
+    """
+
+    def __init__(self) -> None:
+        self._db: Any = None
+
+    def _ensure_db(self) -> Any:
+        if self._db is None:
+            # Imported lazily; tests patch this method.
+            from google.cloud.firestore import AsyncClient
+
+            project = os.environ.get("GCP_PROJECT") or os.environ.get(
+                "GOOGLE_CLOUD_PROJECT"
+            )
+            kwargs: dict[str, Any] = {}
+            if project:
+                kwargs["project"] = project
+            self._db = AsyncClient(**kwargs)
+        return self._db
+
+    async def create_draft(
+        self,
+        *,
+        text: str,
+        due_ts: float,
+        due_iso: str,
+        doc_id: str,
+        created_at: str,
+    ) -> str:
+        db = self._ensure_db()
+        reminder_id = uuid.uuid4().hex
+        await (
+            db.collection(REMINDERS_COLLECTION)
+            .document(reminder_id)
+            .set(
+                {
+                    "text": text,
+                    "due_at": due_iso,
+                    "due_ts": due_ts,
+                    "topic": None,
+                    "status": "draft",
+                    "session_ref": doc_id,
+                    "created_at": created_at,
+                }
+            )
+        )
+        return reminder_id
+
+    async def get_status(self, reminder_id: str) -> dict[str, Any] | None:
+        snap = await (
+            self._ensure_db()
+            .collection(REMINDERS_COLLECTION)
+            .document(reminder_id)
+            .get()
+        )
+        return snap.to_dict() if snap.exists else None
+
+    async def set_status(self, reminder_id: str, status: str) -> None:
+        await (
+            self._ensure_db()
+            .collection(REMINDERS_COLLECTION)
+            .document(reminder_id)
+            .set(
+                {"status": status, "updated_at": _utcnow_iso()},
+                merge=True,
+            )
+        )
+
+
+class InMemoryReminderStore(ReminderStore):
+    """Null-persistence stand-in (and test double)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reminders: dict[str, dict[str, Any]] = {}
+
+    async def create_draft(self, *, text, due_ts, due_iso, doc_id, created_at) -> str:
+        self._db = object()  # mark configured without touching Firestore
+        reminder_id = uuid.uuid4().hex
+        self.reminders[reminder_id] = {
+            "text": text,
+            "due_at": due_iso,
+            "due_ts": due_ts,
+            "status": "draft",
+            "session_ref": doc_id,
+            "created_at": created_at,
+        }
+        return reminder_id
+
+    async def get_status(self, reminder_id):
+        d = self.reminders.get(reminder_id)
+        return dict(d) if d else None
+
+    async def set_status(self, reminder_id, status):
+        if reminder_id in self.reminders:
+            self.reminders[reminder_id]["status"] = status
+
+
+async def _handle_create_reminder(
+    args: dict[str, Any],
+    reminders: ReminderStore,
+    doc_id: str,
+    *,
+    now_s: float | None = None,
+) -> dict[str, Any]:
+    now_s = time.time() if now_s is None else now_s
+    text = str((args or {}).get("text") or "").strip()
+    if not text:
+        return {"error": "empty reminder text"}
+    text = _truncate(text, MAX_REMINDER_TEXT_CHARS)
+    due_ts, err = _resolve_due((args or {}).get("due_at"), now_s=now_s)
+    if err:
+        return {"error": err}
+
+    due_utc = datetime.fromtimestamp(due_ts, tz=timezone.utc)
+    draft_id = await reminders.create_draft(
+        text=text,
+        due_ts=due_ts,
+        due_iso=due_utc.isoformat(),
+        doc_id=doc_id,
+        # Same injected clock as the TTL check — one time authority per call.
+        created_at=datetime.fromtimestamp(now_s, tz=timezone.utc).isoformat(),
+    )
+    when_human = due_utc.astimezone(_user_tz()).strftime("%A, %d %B at %I:%M %p")
+    return {
+        "result": (
+            f"Draft ready: remind to {text} on {when_human}. "
+            "Read the what and when back to the user and ask them to "
+            "confirm; only after they clearly say yes call confirm_reminder "
+            f"with draft_id {draft_id}."
+        ),
+        "draft_id": draft_id,
+        "due_at_utc": due_utc.isoformat(),
+        "next_step": "confirm_reminder",
+    }
+
+
+async def _handle_confirm_reminder(
+    args: dict[str, Any], reminders: ReminderStore, *, now_s: float | None = None
+) -> dict[str, Any]:
+    now_s = time.time() if now_s is None else now_s
+    reminder_id = str((args or {}).get("reminder_id") or "").strip()
+    if not reminder_id:
+        return {"error": "missing reminder_id"}
+
+    data = await reminders.get_status(reminder_id)
+    if data is None:
+        return {"error": f"unknown reminder '{reminder_id}'"}
+    status = data.get("status")
+    if status == "scheduled":
+        # Idempotent double-confirm: safe to answer success again.
+        return {"result": "Reminder confirmed.", "already_confirmed": True}
+    if status != "draft":
+        return {"error": f"reminder is not pending confirmation (status={status})"}
+
+    # Stale-draft guard: a draft left unconfirmed past its TTL can no longer
+    # be trusted to match what the user just said yes to — re-create instead.
+    created_at = data.get("created_at")
+    try:
+        age_s = now_s - datetime.fromisoformat(created_at).timestamp()
+    except (TypeError, ValueError):
+        age_s = DRAFT_TTL_S + 1  # unparsable → treat as stale, fail closed
+    if age_s > DRAFT_TTL_S:
+        return {
+            "error": (
+                "this draft expired — please create the reminder again"
+            ),
+            "draft_id": reminder_id,
+        }
+
+    # Chunk 2 will schedule the Cloud Tasks task HERE. For now the flip to
+    # "scheduled" records user consent; nothing fires yet by design.
+    await reminders.set_status(reminder_id, "scheduled")
+    return {"result": "Reminder confirmed.", "reminder_id": reminder_id}
+
+
+async def _handle_cancel_reminder(
+    args: dict[str, Any], reminders: ReminderStore
+) -> dict[str, Any]:
+    reminder_id = str((args or {}).get("reminder_id") or "").strip()
+    if not reminder_id:
+        return {"error": "missing reminder_id"}
+    data = await reminders.get_status(reminder_id)
+    if data is None:
+        return {"error": f"unknown reminder '{reminder_id}'"}
+    if data.get("status") in ("fired", "cancelled"):
+        return {"result": "Reminder was already closed."}
+    await reminders.set_status(reminder_id, "cancelled")
+    return {"result": "Reminder cancelled."}
+
+
+async def _handle_get_current_time() -> dict[str, Any]:
+    """Server-authoritative clock for the model. Replaces prompt-injected
+    timestamps: the prefix stays byte-identical across reconnects and can
+    never go stale mid-session."""
+    now_local = datetime.now().astimezone(_user_tz())
+    return {
+        "result": (
+            now_local.strftime("It is %A, %d %B %Y, %I:%M %p")
+            + f" ({now_local.tzname()})."
+        ),
+        "iso_utc": datetime.now(timezone.utc).isoformat(),
+        "weekday": now_local.strftime("%A"),
+    }
+
+
 # ── Registry ─────────────────────────────────────────────────────────────────
 
 Handler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -429,6 +868,7 @@ def build_registry(
     memory: Any,
     persist_enabled: bool | None = None,
     tools_enabled: bool | None = None,
+    reminders_enabled: bool | None = None,
     tavily_key: str | None = None,
 ) -> tuple[ToolRegistry, AuditLog]:
     """Build this connection's registry according to configuration.
@@ -440,6 +880,8 @@ def build_registry(
         tools_enabled = os.environ.get("SIRIOUS_TOOLS") == "1"
     if persist_enabled is None:
         persist_enabled = os.environ.get("SIRIOUS_PERSIST") == "1"
+    if reminders_enabled is None:
+        reminders_enabled = os.environ.get("SIRIOUS_REMINDERS") == "1"
     if tavily_key is None:
         tavily_key = os.environ.get("TAVILY_API_KEY")
 
@@ -518,6 +960,106 @@ def build_registry(
                     NotesStore() if persist_enabled else InMemoryNotesStore(),
                     doc_id,
                 ),
+            )
+        )
+
+    # Reminders (chunk 1 of Phase 4 reminders): draft → spoken confirm →
+    # schedule. Gated behind SIRIOUS_REMINDERS=1 on top of the master gate so
+    # it can be rolled out independently of web_search/notes. The store is
+    # Firestore when persistence is on, in-memory otherwise — same null-mode
+    # pattern as notes and audit.
+    if tools_enabled and reminders_enabled:
+        reminder_store = (
+            ReminderStore() if persist_enabled else InMemoryReminderStore()
+        )
+        registry.register(
+            ToolSpec(
+                name="get_current_time",
+                description=(
+                    "Get the current date, time and weekday in the user's "
+                    "timezone. Use whenever a 'when is it now', 'what day is "
+                    "it' question comes up, or before creating a reminder "
+                    "when you need to anchor relative phrases."
+                ),
+                parameters={},
+                handler=lambda args: _handle_get_current_time(),
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="create_reminder",
+                description=(
+                    "Set a reminder for the user. STEP 1 of 2: this only "
+                    "creates a DRAFT — nothing is scheduled yet. Pass "
+                    "due_at as the user's own words (see due_at). Always "
+                    "read the draft back (what + when) and ask them to "
+                    "confirm; only after they clearly say yes, call "
+                    "confirm_reminder with the returned draft_id."
+                ),
+                parameters={
+                    "text": {
+                        "type": "STRING",
+                        "description": (
+                            "What to remind the user about, e.g. 'call Raj'."
+                        ),
+                        "required": True,
+                    },
+                    "due_at": {
+                        "type": "STRING",
+                        "description": (
+                            "When it should fire, as the USER'S OWN WORDS — "
+                            "the server resolves them against the current "
+                            "time in the user's timezone. Supported: 'in 20 "
+                            "minutes', 'tomorrow 9 am', 'friday morning', "
+                            "'next monday 2 pm', 'tonight', 'day after "
+                            "tomorrow at 5 pm', or ISO 8601 with offset. Do "
+                            "NOT compute dates yourself; pass the phrase."
+                        ),
+                        "required": True,
+                    },
+                },
+                handler=lambda args: _handle_create_reminder(
+                    args, reminder_store, doc_id
+                ),
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="confirm_reminder",
+                description=(
+                    "STEP 2 of 2 for setting a reminder. Call ONLY after the "
+                    "user has explicitly confirmed the draft you read back. "
+                    "Passes the draft_id from create_reminder; scheduling "
+                    "happens here."
+                ),
+                parameters={
+                    "reminder_id": {
+                        "type": "STRING",
+                        "description": "The draft_id returned by create_reminder.",
+                        "required": True,
+                    },
+                },
+                requires_confirmation=False,  # this call IS the confirmation step
+                handler=lambda args: _handle_confirm_reminder(
+                    args, reminder_store
+                ),
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="cancel_reminder",
+                description=(
+                    "Cancel a pending or scheduled reminder by its id when the "
+                    "user asks to stop it."
+                ),
+                parameters={
+                    "reminder_id": {
+                        "type": "STRING",
+                        "description": "The reminder id to cancel.",
+                        "required": True,
+                    },
+                },
+                handler=lambda args: _handle_cancel_reminder(args, reminder_store),
             )
         )
 

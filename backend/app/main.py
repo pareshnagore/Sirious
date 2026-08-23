@@ -310,7 +310,10 @@ async def websocket_endpoint(
     except Exception as e:  # noqa: BLE001
         log_event(session_id, "memory_recall_error", error=repr(e))
 
-    # Tool registry (Phase 4): every function-calling tool — Phase 3's
+    # (No date/time in the system instruction — a per-session timestamp would
+    # churn the prompt prefix on every reconnect and go stale on long/resumed
+    # sessions. Temporal grounding lives in tools.py instead: the model passes
+    # the user's own words to create_reminder and the server resolves them.)
     # agentic recall AND Phase 4's actions (web_search, add_note) — is
     # declared by app/tools.py per connection and executed through ONE
     # dispatcher in the receive loop below, with an audit record per call.
@@ -340,6 +343,13 @@ async def websocket_endpoint(
                     "When the user asks you to note down, save, or capture "
                     "something for later, write it with the add_note tool "
                     "and confirm briefly."
+                )
+            if "create_reminder" in names:
+                hints.append(
+                    "For 'remind me to …' requests, always use the two-step "
+                    "reminder flow: create_reminder first, read the draft "
+                    "(what and when) back to the user, and only call "
+                    "confirm_reminder after they clearly say yes."
                 )
             tools_hint = (" " + " ".join(hints)) if hints else ""
             log_event(session_id, "tools_registered", tools=registry.names())
