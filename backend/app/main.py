@@ -321,8 +321,8 @@ async def websocket_endpoint(
             doc_id=doc_id,
             memory=memory,
         )
-        tool_declarations = registry.genai_tool()
-        if tool_declarations is not None:
+        tool_declarations = registry.genai_tools()
+        if tool_declarations:
             # Tool-usage hints: native-audio models trigger declared functions
             # far more reliably when the system instruction tells them WHEN
             # each tool applies (only added for tools actually registered).

@@ -134,7 +134,7 @@ def test_no_tools_when_gates_off(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     reg, audit = _mk_registry(memory=_DisabledMemory())
     assert reg.names() == []
-    assert reg.genai_tool() is None  # Gemini rejects empty declarations
+    assert reg.genai_tools() is None  # empty declarations are never sent
 
 
 def test_memory_tool_only_without_tools_gate(monkeypatch):
@@ -165,7 +165,7 @@ def test_web_search_needs_key_but_note_needs_only_persist(monkeypatch):
     assert reg.names() == ["add_note"]
 
 
-def test_genai_tool_declares_all_specs():
+def test_genai_tools_wire_shape_is_list():
     reg = ToolRegistry(
         audit=AuditLog(use_firestore=False),
         session_id="s",
@@ -182,9 +182,12 @@ def test_genai_tool_declares_all_specs():
             handler=lambda a: {},
         )
     )
-    tool = reg.genai_tool()
-    assert tool is not None
-    decl = tool.function_declarations[0]
+    tools = reg.genai_tools()
+    assert isinstance(tools, list) and len(tools) == 1
+    # WIRE CONTRACT (prod, rev 00029): LiveConnectConfig tools= iterates the
+    # value; a bare single types.Tool here dies at connect with
+    # AttributeError("'tuple' object has no attribute 'function_declarations'").
+    decl = tools[0].function_declarations[0]
     assert decl.name == "t_one"
     assert set(decl.parameters.properties) == {"q", "opt"}
     assert decl.parameters.required == ["q"]

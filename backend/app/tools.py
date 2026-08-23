@@ -276,9 +276,15 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._specs)
 
-    def genai_tool(self):
-        """Single types.Tool carrying every registered declaration, or None
-        when no tools registered (Gemini rejects empty declarations)."""
+    def genai_tools(self) -> list | None:
+        """List of types.Tool carrying every registered declaration, or None
+        when no tools registered.
+
+        WIRE CONTRACT (learned in prod, revision 00029): LiveConnectConfig
+        tools= requires a LIST of types.Tool. A single bare Tool raises
+        AttributeError("'tuple' object has no attribute ...") deep inside
+        the SDK at connect time.
+        """
         if not self._specs:
             return None
         from google.genai import types
@@ -302,7 +308,7 @@ class ToolRegistry:
             )
             for s in self._specs.values()
         ]
-        return types.Tool(function_declarations=decls)
+        return [types.Tool(function_declarations=decls)]
 
     async def dispatch(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Execute one tool call. ALWAYS returns a JSON-safe payload dict —
@@ -427,7 +433,7 @@ def build_registry(
 ) -> tuple[ToolRegistry, AuditLog]:
     """Build this connection's registry according to configuration.
 
-    Returns (registry, audit) — main.py passes registry.genai_tool() into the
+    Returns (registry, audit) — main.py passes registry.genai_tools() into the
     LiveConnectConfig and routes tool_call frames to registry.dispatch().
     """
     if tools_enabled is None:
