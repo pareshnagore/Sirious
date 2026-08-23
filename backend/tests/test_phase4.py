@@ -1041,7 +1041,8 @@ def test_fire_endpoint_auth_and_flow(monkeypatch):
     r1 = client.post("/internal/fire-reminder", json={"reminder_id": "x"})
     assert r1.status_code == 401
     monkeypatch.setattr(
-        main_mod, "verify_tasks_oidc", lambda tok, aud: ("signer@sa.iam", "")
+        main_mod, "verify_tasks_oidc",
+        lambda tok, aud, expected_signer=None: ("signer@sa.iam", ""),
     )
     r2 = client.post(
         "/internal/fire-reminder",
@@ -1053,7 +1054,9 @@ def test_fire_endpoint_auth_and_flow(monkeypatch):
     monkeypatch.setattr(
         main_mod,
         "verify_tasks_oidc",
-        lambda tok, aud: (captured_tokens.append(tok) or ("signer@sa.iam", "")),
+        lambda tok, aud, expected_signer=None: (
+            captured_tokens.append(tok) or ("signer@sa.iam", "")
+        ),
     )
     r2b = client.post(
         "/internal/fire-reminder",
