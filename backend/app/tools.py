@@ -718,8 +718,9 @@ def verify_tasks_oidc(token: str, audience: str) -> tuple[str | None, str]:
     except ImportError:
         return None, "google-auth not installed"
     try:
-        claims = google_jwt.decode(token, certs_url=_GOOGLE_CERTS_URL,
-                                   audience=audience)
+        # Default cert source is Google's public JWKS — no certs_url needed
+        # (and older google-auth builds reject that kwarg: rev 00034 lesson).
+        claims = google_jwt.decode(token, audience=audience)
     except Exception as e:  # noqa: BLE001 — malformed/expired/wrong audience
         log.warning("fire-request OIDC rejected: %r", e)
         return None, "invalid or expired token"
@@ -728,9 +729,6 @@ def verify_tasks_oidc(token: str, audience: str) -> tuple[str | None, str]:
     if claims.get("email_verified") is not True:
         return None, "email not verified"
     return claims.get("email"), ""
-
-
-_GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 
 
 class InMemoryReminderStore(ReminderStore):
