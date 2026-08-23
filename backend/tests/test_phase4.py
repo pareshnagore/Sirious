@@ -84,26 +84,32 @@ class FakeDb:
     def collection(self, name):
         return _Coll(self.db, name)
 
-    async def transaction(self, runner):
-        """Firestore-style transaction: read during the runner, writes applied
-        at commit (after the precondition checks have run)."""
+    def transaction(self):
+        """Async-client-style: ``async with db.transaction() as tx:`` —
+        reads inside use tx; buffered writes commit at __aexit__, i.e. only
+        if every precondition check inside passed."""
+        return self
 
-        class _Tx:
-            def __init__(self):
-                self.ops = []
+    async def __aenter__(self):
+        self._tx_ops = []
+        return self
 
-            def set(self, ref, data, merge=False):
-                self.ops.append((ref, data, merge))
+    async def __aexit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            for ref, data, merge in getattr(self, "_tx_ops", []):
+                cur = self.db.setdefault(ref.coll, {}).setdefault(ref.id, {})
+                if merge:
+                    cur.update(data)
+                else:
+                    cur.clear()
+                    cur.update(data)
+        self._tx_ops = []
+        return False
 
-        tx = _Tx()
-        await runner(tx)
-        for ref, data, merge in tx.ops:
-            cur = self.db.setdefault(ref.coll, {}).setdefault(ref.id, {})
-            if merge:
-                cur.update(data)
-            else:
-                cur.clear()
-                cur.update(data)
+    def set(self, ref, data, merge=False):
+        """Buffered write when FakeDb is acting as the transaction object."""
+        if hasattr(self, "_tx_ops"):
+            self._tx_ops.append((ref, data, merge))
 
 
 class _FakeResponse:

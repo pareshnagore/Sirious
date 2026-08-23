@@ -576,13 +576,15 @@ class ReminderStore:
         db = self._ensure_db()
         ref = db.collection(REMINDERS_COLLECTION).document(reminder_id)
 
-        async def _tx(transaction):
-            snap = await ref.get(transaction=transaction)
+        # Async client: transaction is an async CONTEXT MANAGER (the
+        # await-db.transaction(runner) form is sync-client only — rev 00038).
+        async with db.transaction() as tx:
+            snap = await ref.get(transaction=tx)
             if not snap.exists:
                 raise KeyError("reminder vanished during fire")
             if (snap.to_dict() or {}).get("status") != "scheduled":
                 raise _AlreadyFired()
-            transaction.set(
+            tx.set(
                 ref,
                 {
                     "status": "fired",
@@ -591,11 +593,6 @@ class ReminderStore:
                 },
                 merge=True,
             )
-
-        try:
-            await db.transaction(_tx)
-        except (_AlreadyFired, KeyError):
-            raise
 
     async def get_task_name(self, reminder_id: str) -> str | None:
         data = await self.get_status(reminder_id)
