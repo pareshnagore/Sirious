@@ -68,10 +68,13 @@ Product phases span multiple layers. A single product phase may complete parts o
 ✅ Contextual memory (Phase 3, 22 Aug 2026): extraction pipeline, embeddings,
    dedup, wallet injection, agentic search tool, Memories UI, session
    deletion with memory cascade — recall test PASS in prod
-❌ Tools beyond memory-search, multi-speaker, vision
+✅ Tools & actions v1 (Phase 4, 23 Aug 2026): server-side tool registry,
+   web_search (Tavily) + add_note (Firestore), per-call audit log —
+   both tools live-proven in prod (structured logs + spoken answers)
+❌ Reminders (FCM + Cloud Tasks — direction agreed), multi-speaker, vision
 ```
 
-**Active focus:** Phase 3 closed 22 Aug 2026. Next: **Phase 4 — tools & actions** (calendar, reminders, web search via the same function-calling layer the memory tool proved out).
+**Active focus:** Phase 4 v1 (registry + web_search + add_note + audit) deployed 23 Aug 2026 (rev 00030) and live-verified. Remaining in Phase 4: Paresh's on-device voice verification; then reminders (FCM + Cloud Tasks, direction agreed 23 Aug).
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -190,7 +193,7 @@ Developer runs a test client on laptop; speaks; hears Gemini respond. No product
 
 ---
 
-## Phase 1 — Personal voice assistant on mobile (NOW)
+## Phase 1 — Personal voice assistant on mobile (DONE)
 
 ### Goal
 
@@ -461,7 +464,7 @@ topics, not just keywords.
 
 ---
 
-## Phase 4 — Tools & actions (LATER)
+## Phase 4 — Tools & actions (IN PROGRESS — v1 deployed 23 Aug 2026)
 
 ### Goal
 
@@ -498,9 +501,66 @@ Sirious: [ searches, summarizes verbally ]
 
 ### Success criteria
 
-- [ ] At least two tools work reliably via voice
-- [ ] User is informed before irreversible actions
-- [ ] Tool failures degrade gracefully (spoken error, no crash)
+- [ ] At least two tools work reliably via voice ← **web_search + add_note pass in prod probes; pending Paresh's on-device voice verification**
+- [ ] User is informed before irreversible actions ← scaffolded (`requires_confirmation` flag); no shipped tool needs it yet
+- [ ] Tool failures degrade gracefully (spoken error, no crash) ← verified: handler errors become structured payloads, model speaks a graceful fallback
+
+### Progress (23 Aug 2026 — v1 built, deployed rev 00030, live-proven)
+
+```text
+✅ backend/app/tools.py: per-connection ToolRegistry — declarations,
+   handlers, gating, dispatch; every call audited exactly once.
+   Gates: SIRIOUS_TOOLS=1 (master), TAVILY_API_KEY (web_search),
+   SIRIOUS_PERSIST=1 (add_note). search_past_conversations keeps its
+   Phase 3 gate (memory enabled) — Phase 3 behavior byte-for-byte.
+✅ main.py: hardcoded tool branch replaced by ONE generic dispatcher;
+   registry drives LiveConnectConfig.tools; tool-usage hints appended
+   to system instruction only for tools actually registered.
+✅ web_search: TavilyProvider behind a provider interface (swap Serper/
+   Brave = one adapter class); top-5 title/snippet/url, snippets capped
+   at 350 chars; empty query / no results / provider failure all return
+   structured payloads the model can speak gracefully.
+✅ add_note: Firestore tool_notes/{id} (text ≤4000 chars, optional topic,
+   session_ref provenance, created_at).
+✅ Audit log: EVERY invocation (ok/error/unknown_tool) → tool_audit doc,
+   fire-and-forget so audit can never break the voice path; args
+   truncated to 500 chars in the log.
+✅ Confirmation scaffold: ToolSpec.requires_confirmation exists; first
+   destructive tool implements draft→confirm→execute against it.
+✅ Tests: 58 pass (22 new: registry gating, wire shape, dispatch+audit,
+   Tavily request mapping, notes store, audit Firestore mode, P3 parity)
+✅ Prod probes (rev 00030): web_search answered current bullet-train
+   news from live results (tool_called→tool_result ok, 2.5 s);
+   add_note saved "filter coffee place in Indiranagar" with model-chosen
+   topic "coffee plans" (outcome ok) — both visible in structured logs
+❌ Paresh's on-device voice verification of both tools
+❌ Reminders — direction AGREED 23 Aug: FCM push + Cloud Tasks one-shot
+   scheduling (no polling). Deferred out of v1 deliberately.
+```
+
+#### Deployment notes (learned the hard way)
+
+- **LiveConnectConfig `tools=` requires a LIST of types.Tool** (rev 00029
+  lesson): passing a single bare Tool dies at connect with
+  `AttributeError("'tuple' object has no attribute 'function_declarations'")`
+  — session starts, then instantly ends with zero audio. Unit tests that
+  only check construction miss this; test the list shape.
+- Native-audio models rarely trigger declared functions on their own;
+  system-instruction hints ("for current events … use web_search") made
+  triggering reliable on the first probe.
+
+#### Design decisions worth remembering
+
+- **Tavily chosen over Serper/Brave/DDG/Gemini-grounding** (23 Aug):
+  agent-native output, existing key, 1k free calls/mo covers personal use;
+  query+results flow through OUR code so the audit-log scope is met
+  honestly. Gemini native grounding hides usage from our audit path.
+- **Reminder delivery decided**: FCM push triggered by Cloud Tasks
+  one-shot HTTPS tasks scheduled at each reminder's exact due instant —
+  no polling interval at all. Google Calendar rejected for now (OAuth
+  restricted-scope bureaucracy, silent token-death failure mode).
+- **Audit-first discipline**: unknown-tool calls are audited too, so a
+  hallucinated tool name shows up in tool_audit immediately.
 
 ### Architecture note
 

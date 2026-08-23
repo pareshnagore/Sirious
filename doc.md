@@ -122,6 +122,9 @@ backend/
   app/store.py                 Firestore session history (async queue+writer)
   app/memory.py                Phase 3 memory: extraction, embeddings, dedup,
                                retrieval, /memories backing (same queue+writer pattern)
+  app/tools.py                 Phase 4 tool registry: declarations, handlers,
+                               gating (SIRIOUS_TOOLS/TAVILY_API_KEY), dispatch,
+                               per-call audit (tool_audit), web_search + add_note
   docs/websocket_protocol.md   wire protocol v2 (authoritative)
   recall_test.py               Phase 3 north-star recall harness (edge-tts E2E)
   requirements.txt             pinned deps (google-genai==2.19.0)
@@ -178,7 +181,9 @@ History/search UI                                ✅ Phase 2 (list + transcript 
 Transcript-replay fallback (resume expired)      ✅ Phase 2 (live-verified 22 Aug)
 Auth                                             ✅ Phase 2 (bearer token, REST + WS)
 Long-term memory                                 ✅ Phase 3 done 22 Aug 2026 (recall PASS, user-accepted)
-Tools / actions                                  ❌ Phase 4 (next — function-calling layer already proven by memory tool)
+Tools / actions                                  🟡 Phase 4 v1 live 23 Aug 2026 (registry,
+                                                 web_search via Tavily, add_note, audit log —
+                                                 prod-proven; reminders next via FCM+Cloud Tasks)
 ```
 
 ---
@@ -188,7 +193,8 @@ Tools / actions                                  ❌ Phase 4 (next — function-
 Phased plan with scope-in/scope-out lives in `product_phases.md`. Shape of the road:
 
 * **Phase 3 — Contextual memory:** extraction pipeline over transcripts → episodic/semantic/entity/task memories. Never store raw transcripts as memory. The Phase 2 Firestore store is the raw material.
-* **Phase 4+ — Tools, calendar/email/files, then agentic behavior.** The voice interface becomes the front door to an agent, not the agent itself.
+* **Phase 4 (v1 done 23 Aug 2026)** — tools & actions: server-side tool registry (`app/tools.py`); `web_search` (Tavily, provider-swappable) and `add_note` (Firestore) behind one generic dispatcher with a per-call audit log (`tool_audit`); confirmation scaffold (`requires_confirmation`) for future destructive tools; system-instruction tool hints. Both tools live-proven in prod (structured logs + spoken answers). Reminders deliberately deferred — direction agreed: FCM push + Cloud Tasks one-shot scheduling.
+* **Phase 5+ — ambient/multi-speaker, people recognition, deeper agentic behavior.** The voice interface becomes the front door to an agent, not the agent itself.
 
 Layering principle (unchanged since the start): transport → conversation management → client UX → persistence → memory → tools → autonomy. Build in order; don't merge layers prematurely.
 
@@ -196,4 +202,4 @@ Layering principle (unchanged since the start): transport → conversation manag
 
 # 10. One-line status
 
-> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity, persistent history, AND contextual memory with agentic recall in production — Phase 3 closed 22 Aug 2026 (recall test PASS, user-accepted); next: Phase 4 tools & actions.**
+> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity, persistent history, contextual memory with agentic recall, AND its first real tools (web search, notes — audited) in production — Phase 4 v1 live 23 Aug 2026; next: on-device verification, then reminders (FCM + Cloud Tasks).**
