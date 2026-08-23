@@ -711,8 +711,16 @@ def _scheduler_from_env() -> Any:
     )
 
 
-def verify_tasks_oidc(token: str, audience: str) -> tuple[str | None, str]:
-    """Verify a Cloud Tasks OIDC token. Returns (email, error)."""
+def verify_tasks_oidc(
+    token: str, audience: str, expected_signer: str | None = None
+) -> tuple[str | None, str]:
+    """Verify a Cloud Tasks OIDC token. Returns (email, error).
+
+    Binding strategy follows Google's Cloud Tasks guidance: cryptographic
+    verify + audience match + ``email`` must equal the SA we TOLD Cloud
+    Tasks to sign with (``expected_signer``, i.e. SIRIOUS_FIRE_OIDC_SA).
+    NOTE (rev 00037 lesson): do NOT assert iss == https://cloud.google.com/iap
+    — that's IAP-specific; SA-signed task tokens carry their own email."""
     try:
         from google.auth.transport.requests import Request
         from google.oauth2.id_token import verify_token
@@ -720,8 +728,7 @@ def verify_tasks_oidc(token: str, audience: str) -> tuple[str | None, str]:
         return None, "google-auth not installed"
     try:
         # High-level verifier: fetches Google's public keys and enforces
-        # signature + expiry + audience. (google.auth.jwt.decode alone needs
-        # an explicit cert iterable — rev 00034/00035 prod lessons.)
+        # signature + expiry + audience.
         claims = verify_token(
             token,
             Request(),
@@ -731,11 +738,13 @@ def verify_tasks_oidc(token: str, audience: str) -> tuple[str | None, str]:
     except Exception as e:  # noqa: BLE001 — malformed/expired/wrong audience
         log.warning("fire-request OIDC rejected: %r", e)
         return None, "invalid or expired token"
-    if claims.get("iss") != "https://cloud.google.com/iap":
-        return None, "unexpected issuer"
     if claims.get("email_verified") is not True:
         return None, "email not verified"
-    return claims.get("email"), ""
+    email = claims.get("email")
+    if expected_signer and email != expected_signer:
+        log.warning("fire-request signer mismatch: %r", email)
+        return None, "unexpected signer"
+    return email, ""
 
 
 class InMemoryReminderStore(ReminderStore):

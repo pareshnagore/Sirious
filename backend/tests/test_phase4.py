@@ -1093,8 +1093,8 @@ def test_fire_endpoint_auth_and_flow(monkeypatch):
 
 
 def test_verify_tasks_oidc_rejects_bad_issuer(monkeypatch):
-    """Issuer check runs on successfully-decoded claims — a token signed by
-    Google but minted for something else must not pass."""
+    """Claim checks run on successfully-decoded claims — a token signed by
+    Google but minted by an unexpected SA must not pass."""
     import google.oauth2.id_token as id_token_mod
 
     captured = {}
@@ -1106,9 +1106,29 @@ def test_verify_tasks_oidc_rejects_bad_issuer(monkeypatch):
                 "email": "attacker@example.com"}
 
     monkeypatch.setattr(id_token_mod, "verify_token", fake_verify)
-    email, err = tools_mod.verify_tasks_oidc("any-token", "https://aud")
-    assert email is None and err == "unexpected issuer"
+    email, err = tools_mod.verify_tasks_oidc(
+        "any-token", "https://aud", expected_signer="sa@proj.iam"
+    )
+    assert email is None and err == "unexpected signer"
     assert captured["audience"] == "https://aud"
+
+
+def test_verify_tasks_oidc_accepts_expected_signer(monkeypatch):
+    import google.oauth2.id_token as id_token_mod
+
+    def fake_verify(token, request, audience=None, certs_url=None,
+                    clock_skew_in_seconds=0):
+        return {"iss": "https://cloud.google.com/iap",
+                "email_verified": True,
+                "email": "sirious-reminders-signer@sirious-2026.iam.gserviceaccount.com"}
+
+    monkeypatch.setattr(id_token_mod, "verify_token", fake_verify)
+    email, err = tools_mod.verify_tasks_oidc(
+        "tok", "https://aud",
+        expected_signer="sirious-reminders-signer@sirious-2026.iam.gserviceaccount.com",
+    )
+    assert email == "sirious-reminders-signer@sirious-2026.iam.gserviceaccount.com"
+    assert err == ""
 
 
 def test_verify_tasks_oidc_rejects_garbage(monkeypatch):

@@ -279,7 +279,11 @@ async def fire_reminder(
     if not token:
         log_event("fire", "fire_token_missing")
         return JSONResponse(status_code=401, content={"detail": "missing task token"})
-    email, err = verify_tasks_oidc(token, FIRE_AUDIENCE)
+    email, err = verify_tasks_oidc(
+        token,
+        FIRE_AUDIENCE,
+        expected_signer=os.environ.get("SIRIOUS_FIRE_OIDC_SA") or None,
+    )
     if err:
         log_event("fire", "fire_auth_rejected", error=err)
         return JSONResponse(status_code=401, content={"detail": err})
