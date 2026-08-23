@@ -323,10 +323,30 @@ async def websocket_endpoint(
         )
         tool_declarations = registry.genai_tool()
         if tool_declarations is not None:
+            # Tool-usage hints: native-audio models trigger declared functions
+            # far more reliably when the system instruction tells them WHEN
+            # each tool applies (only added for tools actually registered).
+            names = set(registry.names())
+            hints = []
+            if "web_search" in names:
+                hints.append(
+                    "For current events, news, prices, weather, sports "
+                    "scores, or any fact you are unsure about, search the "
+                    "web with the web_search tool instead of answering "
+                    "from memory."
+                )
+            if "add_note" in names:
+                hints.append(
+                    "When the user asks you to note down, save, or capture "
+                    "something for later, write it with the add_note tool "
+                    "and confirm briefly."
+                )
+            tools_hint = (" " + " ".join(hints)) if hints else ""
             log_event(session_id, "tools_registered", tools=registry.names())
     except Exception as e:  # noqa: BLE001
         log_event(session_id, "tools_registry_error", error=repr(e))
         registry, audit_log, tool_declarations = None, None, None
+        tools_hint = ""
 
     store.start_session(
         doc_id,
@@ -491,6 +511,7 @@ async def websocket_endpoint(
                     "You are Sirious, a helpful and concise voice assistant. "
                     "ALWAYS respond in English, no matter what language the "
                     "user speaks or is detected as speaking."
+                    + tools_hint
                     + replay_block
                     + memory_block
                 ),
