@@ -1095,16 +1095,29 @@ def test_fire_endpoint_auth_and_flow(monkeypatch):
 def test_verify_tasks_oidc_rejects_bad_issuer(monkeypatch):
     """Issuer check runs on successfully-decoded claims — a token signed by
     Google but minted for something else must not pass."""
-    import google.auth.jwt as google_jwt
+    import google.oauth2.id_token as id_token_mod
 
     captured = {}
 
-    def fake_decode(token, certs_url=None, audience=None):
+    def fake_verify(token, request, audience=None, certs_url=None,
+                    clock_skew_in_seconds=0):
         captured["audience"] = audience
         return {"iss": "https://evil.example", "email_verified": True,
                 "email": "attacker@example.com"}
 
-    monkeypatch.setattr(google_jwt, "decode", fake_decode)
+    monkeypatch.setattr(id_token_mod, "verify_token", fake_verify)
     email, err = tools_mod.verify_tasks_oidc("any-token", "https://aud")
     assert email is None and err == "unexpected issuer"
     assert captured["audience"] == "https://aud"
+
+
+def test_verify_tasks_oidc_rejects_garbage(monkeypatch):
+    """Undecodable tokens must yield a structured error, never raise."""
+    import google.oauth2.id_token as id_token_mod
+
+    def boom(token, request, **kw):
+        raise ValueError("signature mismatch")
+
+    monkeypatch.setattr(id_token_mod, "verify_token", boom)
+    email, err = tools_mod.verify_tasks_oidc("garbage", "https://aud")
+    assert email is None and err == "invalid or expired token"

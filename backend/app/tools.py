@@ -714,13 +714,20 @@ def _scheduler_from_env() -> Any:
 def verify_tasks_oidc(token: str, audience: str) -> tuple[str | None, str]:
     """Verify a Cloud Tasks OIDC token. Returns (email, error)."""
     try:
-        from google.auth import jwt as google_jwt
+        from google.auth.transport.requests import Request
+        from google.oauth2.id_token import verify_token
     except ImportError:
         return None, "google-auth not installed"
     try:
-        # Default cert source is Google's public JWKS — no certs_url needed
-        # (and older google-auth builds reject that kwarg: rev 00034 lesson).
-        claims = google_jwt.decode(token, audience=audience)
+        # High-level verifier: fetches Google's public keys and enforces
+        # signature + expiry + audience. (google.auth.jwt.decode alone needs
+        # an explicit cert iterable — rev 00034/00035 prod lessons.)
+        claims = verify_token(
+            token,
+            Request(),
+            audience=audience,
+            certs_url="https://www.googleapis.com/oauth2/v3/certs",
+        )
     except Exception as e:  # noqa: BLE001 — malformed/expired/wrong audience
         log.warning("fire-request OIDC rejected: %r", e)
         return None, "invalid or expired token"
