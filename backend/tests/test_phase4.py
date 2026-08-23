@@ -1036,8 +1036,8 @@ def test_fire_endpoint_auth_and_flow(monkeypatch):
         main_mod, "FIRE_AUDIENCE", "https://svc.example/internal/fire-reminder"
     )
 
-    # Missing header → 401; bad token → 401 (verifier stubbed: crypto-level
-    # token tests belong to google-auth).
+    # Missing token → 401; then Bearer-form (what Cloud Tasks actually sends
+    # on HTTP targets) and legacy IAP-header form both authenticate.
     r1 = client.post("/internal/fire-reminder", json={"reminder_id": "x"})
     assert r1.status_code == 401
     monkeypatch.setattr(
@@ -1049,6 +1049,18 @@ def test_fire_endpoint_auth_and_flow(monkeypatch):
         headers={"X-Goog-Iap-Jwt-Assertion": "tok"},
     )
     assert r2.status_code == 404  # authenticated, unknown reminder
+    captured_tokens = []
+    monkeypatch.setattr(
+        main_mod,
+        "verify_tasks_oidc",
+        lambda tok, aud: (captured_tokens.append(tok) or ("signer@sa.iam", "")),
+    )
+    r2b = client.post(
+        "/internal/fire-reminder",
+        json={"reminder_id": "ghost"},
+        headers={"Authorization": "Bearer tok-bearer-form"},
+    )
+    assert r2b.status_code == 404 and captured_tokens[-1] == "tok-bearer-form"
 
     # Real flow through the endpoint on the fake store. Seed due/created on
     # the REAL clock: process_fired_reminder inside main.py uses time.time().

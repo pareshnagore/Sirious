@@ -260,16 +260,26 @@ class _FireRequest(BaseModel):
 @app.post("/internal/fire-reminder")
 async def fire_reminder(
     request: _FireRequest,
+    authorization: str | None = Header(default=None),
     x_goog_iap_jwt_assertion: str | None = Header(default=None),
 ):
     """Cloud Tasks → here. Verifies the OIDC token (audience must equal
     SIRIOUS_FIRE_URL), then process_fired_reminder does the idempotent
-    scheduled→fired flip and dispatches the push. 2xx stops retries."""
+    scheduled→fired flip and dispatches the push. 2xx stops retries.
+
+    NOTE (learned in prod, rev 00033): for plain HTTP targets Cloud Tasks
+    delivers the OIDC token in the AUTHORIZATION header ("Bearer <id-token>") —
+    the X-Goog-Iap-Jwt-Assertion header is IAP's convention. Both accepted."""
     if not FIRE_AUDIENCE:
         return JSONResponse(status_code=503, content={"detail": "fire path not configured"})
-    if not x_goog_iap_jwt_assertion:
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):]
+    token = token or x_goog_iap_jwt_assertion
+    if not token:
+        log_event("fire", "fire_token_missing")
         return JSONResponse(status_code=401, content={"detail": "missing task token"})
-    email, err = verify_tasks_oidc(x_goog_iap_jwt_assertion, FIRE_AUDIENCE)
+    email, err = verify_tasks_oidc(token, FIRE_AUDIENCE)
     if err:
         log_event("fire", "fire_auth_rejected", error=err)
         return JSONResponse(status_code=401, content={"detail": err})
