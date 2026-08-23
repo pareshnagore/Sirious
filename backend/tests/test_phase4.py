@@ -85,31 +85,19 @@ class FakeDb:
         return _Coll(self.db, name)
 
     def transaction(self):
-        """Async-client-style: ``async with db.transaction() as tx:`` —
-        reads inside use tx; buffered writes commit at __aexit__, i.e. only
-        if every precondition check inside passed."""
-        return self
+        """Returns a fresh txn-like object; @async_transactional-style fakes
+        call begin() then run their body, and we commit buffered writes on
+        _end() only if no exception escaped."""
+        return FakeTransaction(self)
 
-    async def __aenter__(self):
-        self._tx_ops = []
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            for ref, data, merge in getattr(self, "_tx_ops", []):
-                cur = self.db.setdefault(ref.coll, {}).setdefault(ref.id, {})
-                if merge:
-                    cur.update(data)
-                else:
-                    cur.clear()
-                    cur.update(data)
-        self._tx_ops = []
-        return False
-
-    def set(self, ref, data, merge=False):
-        """Buffered write when FakeDb is acting as the transaction object."""
-        if hasattr(self, "_tx_ops"):
-            self._tx_ops.append((ref, data, merge))
+    def _commit_txn(self, ops):
+        for ref, data, merge in ops:
+            cur = self.db.setdefault(ref.coll, {}).setdefault(ref.id, {})
+            if merge:
+                cur.update(data)
+            else:
+                cur.clear()
+                cur.update(data)
 
 
 class _FakeResponse:
@@ -1082,6 +1070,17 @@ def test_fire_endpoint_auth_and_flow(monkeypatch):
         created_at=datetime.fromtimestamp(real_now, tz=timezone.utc).isoformat(),
     ))
     asyncio.run(real_store.set_status(rid, "scheduled"))
+    # The real mark_fired uses the Firestore transaction API (prod-verified
+    # separately); stub it here with identical scheduled→fired semantics.
+    async def fake_mark_fired(reminder_id):
+        d = real_store.reminders = getattr(real_store, "reminders", None) or {}
+        doc = fake_db.db[tools_mod.REMINDERS_COLLECTION].get(reminder_id)
+        if doc is None:
+            raise KeyError("not found")
+        if doc.get("status") != "scheduled":
+            raise tools_mod._AlreadyFired()
+        await real_store.set_status(reminder_id, "fired")
+    monkeypatch.setattr(real_store, "mark_fired", fake_mark_fired)
 
     r3 = client.post(
         "/internal/fire-reminder",

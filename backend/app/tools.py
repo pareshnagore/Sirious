@@ -573,12 +573,18 @@ class ReminderStore:
         A concurrent second fire sees status="fired" inside its own
         transaction and raises _AlreadyFired — process_fired_reminder maps
         that to a 200 duplicate-suppressed response."""
+        # Async-client idiom: @async_transactional begins/commits/retries the
+        # txn around the wrapped body (rev 00039 lesson — neither
+        # await db.transaction(fn) nor `async with txn:` begins anything).
+        from google.cloud.firestore_v1.async_transaction import (
+            async_transactional,
+        )
+
         db = self._ensure_db()
         ref = db.collection(REMINDERS_COLLECTION).document(reminder_id)
 
-        # Async client: transaction is an async CONTEXT MANAGER (the
-        # await-db.transaction(runner) form is sync-client only — rev 00038).
-        async with db.transaction() as tx:
+        @async_transactional
+        async def _tx(tx):
             snap = await ref.get(transaction=tx)
             if not snap.exists:
                 raise KeyError("reminder vanished during fire")
@@ -593,6 +599,8 @@ class ReminderStore:
                 },
                 merge=True,
             )
+
+        await _tx(db.transaction())
 
     async def get_task_name(self, reminder_id: str) -> str | None:
         data = await self.get_status(reminder_id)
