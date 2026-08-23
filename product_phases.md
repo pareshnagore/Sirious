@@ -74,7 +74,7 @@ Product phases span multiple layers. A single product phase may complete parts o
 ❌ Reminders (FCM + Cloud Tasks — direction agreed), multi-speaker, vision
 ```
 
-**Active focus:** Phase 4 v1 (registry + web_search + add_note + audit) deployed 23 Aug 2026 (rev 00030) and live-verified. Reminders chunk 1 (get_current_time / create / confirm / cancel tools, server-side NL time resolution — no prompt timestamps, gated SIRIOUS_REMINDERS) built and tested locally 23 Aug — not deployed. Remaining in Phase 4: deploy chunk 1; then reminders chunks 2–4 (Cloud Tasks + fire endpoint → FCM push + token registration → Android client).
+**Active focus:** Phase 4 v1 (registry + web_search + add_note + audit) deployed 23 Aug (rev 00030) and live-verified. Reminders chunks 1+2 DEPLOYED (rev 00040): draft→confirm→schedule via Cloud Tasks one-shot HTTPS tasks, OIDC-verified fire endpoint, idempotent firing — prod-verified end-to-end. Remaining in Phase 4: chunk 3 FCM push (Firebase Admin + device_tokens), chunk 4 Android client, voice verification.
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -571,6 +571,44 @@ Sirious: [ searches, summarizes verbally ]
 ⚠️ By design in chunk 1: confirm flips status only — no Cloud Tasks task
    is scheduled yet, nothing can fire. Chunks 2–4: Cloud Tasks + fire
    endpoint; Firebase Admin push + token registration; Android FCM client.
+```
+
+#### Reminders — chunk 2 built + DEPLOYED + prod-verified (23 Aug 2026)
+
+```text
+✅ tools.py: NullScheduler (SIRIOUS_TASKS_* unset → consent-only) vs
+   CloudTasksScheduler — one-shot HTTPS task per confirmed reminder,
+   DETERMINISTIC task names (rem-{id}-{due_ts}) so an ambiguous Cloud
+   Tasks timeout can't double-schedule. confirm: flip→schedule→store
+   task_name; schedule failure reverts status to draft (consent never
+   stranded without a task). cancel: best-effort task delete first;
+   cancelled-status guard catches any fire that still arrives.
+✅ main.py POST /internal/fire-reminder: OIDC verify → idempotent
+   scheduled→fired flip via Firestore transaction (@async_transactional
+   precondition) → push hook (chunk-3 seam, currently logs only).
+   Response-code policy: fired/already-fired/cancelled → 2xx (stops
+   retries); early-fire beyond 5-min grace → 409 (retry later); unknown
+   → 404. Bearer-auth selftest endpoint /internal/reminders/selftest.
+✅ Prod probe rev 00040 PASS: selftest → task created → fired at due
+   instant → single request, HTTP 200, no retries; Firestore doc
+   scheduled→fired with fired_at stamped.
+✅ Infra: Cloud Tasks API enabled; queue sirious-reminders@asia-south1;
+   SA sirious-reminders-signer (TokenCreator on itself, run.invoker on
+   sirious-api); compute SA enqueuer on project+queue. Env on Cloud Run:
+   SIRIOUS_TASKS_QUEUE / SIRIOUS_FIRE_URL (= canonical run.app URL — new
+   URL after rev 00031!) / SIRIOUS_FIRE_OIDC_SA.
+❗Prod lessons (revs 00033–00039, each a separate fix-commit):
+   - Cloud Tasks delivers OIDC in AUTHORIZATION header ("Bearer …"),
+     NOT X-Goog-Iap-Jwt-Assertion (that's IAP).
+   - google.auth.jwt.decode needs explicit cert iterable; use
+     google.oauth2.id_token.verify_token + pyjwt for JWK-set certs.
+   - Do NOT assert iss==cloud.google.com/iap on task tokens; bind via
+     email == SIRIOUS_FIRE_OIDC_SA instead.
+   - Async Firestore txn = @async_transactional ONLY; neither await
+     db.transaction(fn) nor `async with txn:` begins the transaction.
+⚠️ Remaining: chunk 3 (Firebase Admin FCM send + device_tokens
+   registration), chunk 4 (Android client: google-services.json, FCM
+   service, notification UI), Paresh's voice verification of reminders.
 ```
 
 #### Deployment notes (learned the hard way)
