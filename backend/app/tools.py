@@ -27,7 +27,9 @@ Design notes
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections
+import json
 import logging
 import os
 import re
@@ -52,6 +54,7 @@ DRAFT_TTL_S = 15 * 60               # unconfirmed draft → stale after 15 min
 MAX_REMINDER_TEXT_CHARS = 500
 MIN_LEAD_S = 120                    # must fire ≥ 2 min from now (voice UX)
 MAX_HORIZON_DAYS = 365              # sanity cap on how far out a reminder may be
+FIRE_GRACE_S = 300                  # fire accepted within 5 min BEFORE due (clock skew)
 
 
 def _truncate(text: Any, limit: int) -> str | None:
@@ -548,6 +551,187 @@ class ReminderStore:
             )
         )
 
+    async def set_task(self, reminder_id: str, task_name: str | None) -> None:
+        await (
+            self._ensure_db()
+            .collection(REMINDERS_COLLECTION)
+            .document(reminder_id)
+            .set(
+                {"task_name": task_name, "updated_at": _utcnow_iso()},
+                merge=True,
+            )
+        )
+
+    async def get_status_for_update(
+        self, reminder_id: str
+    ) -> dict[str, Any] | None:
+        return await self.get_status(reminder_id)
+
+    async def mark_fired(self, reminder_id: str) -> None:
+        """Status flip with an idempotency precondition: the write only lands
+        while status == "scheduled", enforced inside a Firestore transaction.
+        A concurrent second fire sees status="fired" inside its own
+        transaction and raises _AlreadyFired — process_fired_reminder maps
+        that to a 200 duplicate-suppressed response."""
+        db = self._ensure_db()
+        ref = db.collection(REMINDERS_COLLECTION).document(reminder_id)
+
+        async def _tx(transaction):
+            snap = await ref.get(transaction=transaction)
+            if not snap.exists:
+                raise KeyError("reminder vanished during fire")
+            if (snap.to_dict() or {}).get("status") != "scheduled":
+                raise _AlreadyFired()
+            transaction.set(
+                ref,
+                {
+                    "status": "fired",
+                    "fired_at": _utcnow_iso(),
+                    "updated_at": _utcnow_iso(),
+                },
+                merge=True,
+            )
+
+        try:
+            await db.transaction(_tx)
+        except (_AlreadyFired, KeyError):
+            raise
+
+    async def get_task_name(self, reminder_id: str) -> str | None:
+        data = await self.get_status(reminder_id)
+        return (data or {}).get("task_name")
+
+
+# ── Reminder scheduling backends (chunk 2) ───────────────────────────────────
+#
+# confirm_reminder schedules ONE one-shot Cloud Tasks HTTP task at the due
+# instant; when it fires it hits our /internal/fire-reminder endpoint with an
+# OIDC Cloud Tasks service-agent token. No polling anywhere.
+
+class NullScheduler:
+    """Chunk-1 behavior: record consent, schedule nothing. Used when
+    SIRIOUS_TASKS_QUEUE is unset (local dev, tests, staged rollouts)."""
+
+    async def schedule(self, reminder_id: str, due_ts: float) -> str | None:
+        return None
+
+    async def cancel(self, task_name: str) -> None:
+        return None
+
+
+class CloudTasksScheduler:
+    """One-shot HTTPS task per confirmed reminder via google-cloud-tasks.
+
+    - ``oidc_service_account``: the SA whose ID token Cloud Tasks attaches;
+      must hold roles/iam.serviceAccountTokenCreator on ITSELF.
+    - ``audience``/``target_url``: our own fire endpoint. Audience must equal
+      the URL Cloud Run receives (custom-domain nuance).
+    - Task names are DETERMINISTIC (reminder id + due second): a Cloud Tasks
+      retry after an ambiguous timeout reuses the same name → no duplicate
+      live tasks for one reminder.
+    """
+
+    def __init__(
+        self,
+        *,
+        queue_path: str,
+        target_url: str,
+        oidc_service_account: str,
+    ) -> None:
+        self._queue_path = queue_path
+        self._target_url = target_url
+        self._oidc_sa = oidc_service_account
+        self._client: Any = None
+
+    def _ensure_client(self) -> Any:
+        if self._client is None:
+            from google.cloud import tasks_v2
+
+            self._client = tasks_v2.CloudTasksAsyncClient()
+        return self._client
+
+    def _task_name(self, reminder_id: str, due_ts: float) -> str:
+        suffix = base64.urlsafe_b64encode(
+            str(int(due_ts)).encode()
+        ).decode().rstrip("=")
+        return f"{self._queue_path}/tasks/rem-{reminder_id}-{suffix}"
+
+    async def schedule(self, reminder_id: str, due_ts: float) -> str | None:
+        from google.cloud import tasks_v2
+        from google.protobuf import timestamp_pb2
+
+        client = self._ensure_client()
+        proto = timestamp_pb2.Timestamp()
+        proto.FromDatetime(datetime.fromtimestamp(due_ts, tz=timezone.utc))
+        task = tasks_v2.Task(
+            name=self._task_name(reminder_id, due_ts),
+            http_request=tasks_v2.HttpRequest(
+                url=self._target_url,
+                http_method=tasks_v2.HttpMethod.POST,
+                headers={
+                    "Content-Type": "application/json",
+                },
+                body=json.dumps(
+                    {"reminder_id": reminder_id}
+                ).encode("utf-8"),
+                oidc_token=tasks_v2.OidcToken(
+                    service_account_email=self._oidc_sa,
+                    audience=self._target_url,
+                ),
+            ),
+            schedule_time=proto,
+        )
+        created = await client.create_task(parent=self._queue_path, task=task)
+        return created.name
+
+    async def cancel(self, task_name: str) -> None:
+        client = self._ensure_client()
+        try:
+            await client.delete_task(name=task_name)
+        except Exception:  # noqa: BLE001 — already-run/gone is fine on cancel
+            log.info("task delete failed (already gone?): %s", task_name)
+
+
+class _AlreadyFired(Exception):
+    """Internal: mark_fired precondition failed (already fired/cancelled)."""
+
+
+def _scheduler_from_env() -> Any:
+    """Build the scheduler from SIRIOUS_TASKS_* env vars; NullScheduler when
+    unconfigured so local dev and tests never touch GCP."""
+    queue = os.environ.get("SIRIOUS_TASKS_QUEUE")       # projects/p/…/queues/x
+    target = os.environ.get("SIRIOUS_FIRE_URL")          # full fire-endpoint URL
+    sa = os.environ.get("SIRIOUS_FIRE_OIDC_SA")           # signer SA email
+    if not (queue and target and sa):
+        return NullScheduler()
+    return CloudTasksScheduler(
+        queue_path=queue,
+        target_url=target,
+        oidc_service_account=sa,
+    )
+
+
+def verify_tasks_oidc(token: str, audience: str) -> tuple[str | None, str]:
+    """Verify a Cloud Tasks OIDC token. Returns (email, error)."""
+    try:
+        from google.auth import jwt as google_jwt
+    except ImportError:
+        return None, "google-auth not installed"
+    try:
+        claims = google_jwt.decode(token, certs_url=_GOOGLE_CERTS_URL,
+                                   audience=audience)
+    except Exception as e:  # noqa: BLE001 — malformed/expired/wrong audience
+        log.warning("fire-request OIDC rejected: %r", e)
+        return None, "invalid or expired token"
+    if claims.get("iss") != "https://cloud.google.com/iap":
+        return None, "unexpected issuer"
+    if claims.get("email_verified") is not True:
+        return None, "email not verified"
+    return claims.get("email"), ""
+
+
+_GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+
 
 class InMemoryReminderStore(ReminderStore):
     """Null-persistence stand-in (and test double)."""
@@ -566,6 +750,7 @@ class InMemoryReminderStore(ReminderStore):
             "status": "draft",
             "session_ref": doc_id,
             "created_at": created_at,
+            "task_name": None,
         }
         return reminder_id
 
@@ -576,6 +761,24 @@ class InMemoryReminderStore(ReminderStore):
     async def set_status(self, reminder_id, status):
         if reminder_id in self.reminders:
             self.reminders[reminder_id]["status"] = status
+
+    async def set_task(self, reminder_id, task_name):
+        if reminder_id in self.reminders:
+            self.reminders[reminder_id]["task_name"] = task_name
+
+    async def mark_fired(self, reminder_id):
+        """Same contract as Firestore: only scheduled→fired succeeds; a
+        second call raises _AlreadyFired so idempotency is testable."""
+        d = self.reminders.get(reminder_id)
+        if d is None:
+            raise KeyError("not found")
+        if d["status"] != "scheduled":
+            raise _AlreadyFired()
+        d["status"] = "fired"
+
+    async def get_task_name(self, reminder_id):
+        d = self.reminders.get(reminder_id)
+        return (dict(d) or {}).get("task_name") if d else None
 
 
 async def _handle_create_reminder(
@@ -618,7 +821,11 @@ async def _handle_create_reminder(
 
 
 async def _handle_confirm_reminder(
-    args: dict[str, Any], reminders: ReminderStore, *, now_s: float | None = None
+    args: dict[str, Any],
+    reminders: ReminderStore,
+    scheduler: Any = None,
+    *,
+    now_s: float | None = None,
 ) -> dict[str, Any]:
     now_s = time.time() if now_s is None else now_s
     reminder_id = str((args or {}).get("reminder_id") or "").strip()
@@ -650,14 +857,32 @@ async def _handle_confirm_reminder(
             "draft_id": reminder_id,
         }
 
-    # Chunk 2 will schedule the Cloud Tasks task HERE. For now the flip to
-    # "scheduled" records user consent; nothing fires yet by design.
+    # Flip FIRST, then schedule. If scheduling fails we revert to draft so
+    # the user's yes isn't silently lost without a live task behind it.
     await reminders.set_status(reminder_id, "scheduled")
-    return {"result": "Reminder confirmed.", "reminder_id": reminder_id}
+    sched = scheduler if scheduler is not None else NullScheduler()
+    try:
+        task_name = await sched.schedule(reminder_id, float(data.get("due_ts") or 0))
+        await reminders.set_task(reminder_id, task_name)
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, keep consent
+        log.exception("scheduling failed for %s", reminder_id)
+        await reminders.set_status(reminder_id, "draft")
+        return {"error": "could not schedule the reminder right now"}
+    scheduled = task_name is not None
+    return {
+        "result": (
+            "Reminder confirmed."
+            + ("" if scheduled else " (scheduling backend not configured)")
+        ),
+        "reminder_id": reminder_id,
+        "task_scheduled": scheduled,
+    }
 
 
 async def _handle_cancel_reminder(
-    args: dict[str, Any], reminders: ReminderStore
+    args: dict[str, Any],
+    reminders: ReminderStore,
+    scheduler: Any = None,
 ) -> dict[str, Any]:
     reminder_id = str((args or {}).get("reminder_id") or "").strip()
     if not reminder_id:
@@ -667,8 +892,97 @@ async def _handle_cancel_reminder(
         return {"error": f"unknown reminder '{reminder_id}'"}
     if data.get("status") in ("fired", "cancelled"):
         return {"result": "Reminder was already closed."}
+    # Best-effort task deletion BEFORE the status flip: if this fails a fire
+    # may still arrive, but it hits the cancelled-status guard below.
+    sched = scheduler if scheduler is not None else NullScheduler()
+    task_name = data.get("task_name")
+    if task_name:
+        await sched.cancel(task_name)
     await reminders.set_status(reminder_id, "cancelled")
     return {"result": "Reminder cancelled."}
+
+
+def _fire_allowed(data: dict[str, Any], *, now_s: float) -> str | None:
+    """Shared guard for the fire path: returns an error string or None."""
+    status = data.get("status")
+    if status == "fired":
+        return "duplicate suppressed"
+    if status != "scheduled":
+        return f"reminder not schedulable (status={status})"
+    due_ts = data.get("due_ts")
+    try:
+        due_ts = float(due_ts)
+    except (TypeError, ValueError):
+        return "reminder has unparsable due_ts"
+    if due_ts > now_s + FIRE_GRACE_S:
+        return (
+            f"refusing to fire early ({(due_ts - now_s) / 60:.0f} min ahead)"
+        )
+    return None
+
+
+async def process_fired_reminder(
+    reminder_id: str,
+    store: ReminderStore,
+    *,
+    push_send: Any = None,
+    now_s: float | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """The /internal/fire-reminder core. Idempotent via the fired-status
+    check inside the transactional flip; push only happens for exactly one
+    caller even under concurrent Cloud Tasks retries. Returns
+    (http_status, response_body).
+
+    ``push_send(text, data) -> None`` is injected by main.py (chunk 3 wires
+    FCM); with None, firing still transitions state and logs — useful for
+    probes and for chunk 2 prod verification via structured logs.
+    """
+    now_s = time.time() if now_s is None else now_s
+
+    async def _flip():
+        data = await store.get_status_for_update(reminder_id)
+        if data is None:
+            return None, "not found"
+        err = _fire_allowed(data, now_s=now_s)
+        if err:
+            return None, err
+        # Firestore store enforces scheduled→fired inside a transaction; a
+        # concurrent duplicate fire loses that race and lands here.
+        try:
+            await store.mark_fired(reminder_id)
+        except _AlreadyFired:
+            return None, "duplicate suppressed"
+        except KeyError:
+            return None, "not found"
+        return data, ""
+
+    data, err = await _flip()
+    if err == "not found":
+        return 404, {"error": "unknown reminder"}
+    if err == "duplicate suppressed":
+        return 200, {"result": "already fired"}
+    if err and "not schedulable" in err:
+        return 200, {"result": err}       # cancelled → swallow, 2xx stops retries
+    if err and "early" in err:
+        return 409, {"error": err}         # misconfigured task → let retry policy apply
+    if err:
+        return 400, {"error": err}
+
+    text = (data or {}).get("text") or "your reminder"
+    if push_send is not None:
+        try:
+            await push_send(
+                text,
+                {"reminder_id": reminder_id, "kind": "reminder"},
+            )
+        except Exception:  # noqa: BLE001 — logged; state already advanced
+            log.exception("push send failed for %s", reminder_id)
+    return 200, {
+        "result": "fired",
+        "reminder_id": reminder_id,
+        "text": text[:100],
+        "push_sent": push_send is not None,
+    }
 
 
 async def _handle_get_current_time() -> dict[str, Any]:
@@ -861,6 +1175,19 @@ async def _handle_memory_recall(args: dict[str, Any], memory: Any) -> dict[str, 
 
 # ── Per-connection builder ───────────────────────────────────────────────────
 
+_reminder_store_singleton: ReminderStore | None = None
+
+
+def get_reminder_store() -> ReminderStore:
+    """Process-wide Firestore-backed reminder store for the REST fire path.
+    (The WS tool path builds a per-connection store inside build_registry;
+    both hit the same collection, so state is shared through Firestore.)"""
+    global _reminder_store_singleton
+    if _reminder_store_singleton is None:
+        _reminder_store_singleton = ReminderStore()
+    return _reminder_store_singleton
+
+
 def build_registry(
     *,
     session_id: str,
@@ -963,15 +1290,17 @@ def build_registry(
             )
         )
 
-    # Reminders (chunk 1 of Phase 4 reminders): draft → spoken confirm →
+    # Reminders (chunk 1 + 2 of Phase 4 reminders): draft → spoken confirm →
     # schedule. Gated behind SIRIOUS_REMINDERS=1 on top of the master gate so
     # it can be rolled out independently of web_search/notes. The store is
     # Firestore when persistence is on, in-memory otherwise — same null-mode
-    # pattern as notes and audit.
+    # pattern as notes and audit. Scheduling is Cloud Tasks when
+    # SIRIOUS_TASKS_* is configured, NullScheduler (consent-only) otherwise.
     if tools_enabled and reminders_enabled:
         reminder_store = (
             ReminderStore() if persist_enabled else InMemoryReminderStore()
         )
+        scheduler = _scheduler_from_env()
         registry.register(
             ToolSpec(
                 name="get_current_time",
@@ -1041,7 +1370,7 @@ def build_registry(
                 },
                 requires_confirmation=False,  # this call IS the confirmation step
                 handler=lambda args: _handle_confirm_reminder(
-                    args, reminder_store
+                    args, reminder_store, scheduler
                 ),
             )
         )
@@ -1059,7 +1388,9 @@ def build_registry(
                         "required": True,
                     },
                 },
-                handler=lambda args: _handle_cancel_reminder(args, reminder_store),
+                handler=lambda args: _handle_cancel_reminder(
+                    args, reminder_store, scheduler
+                ),
             )
         )
 

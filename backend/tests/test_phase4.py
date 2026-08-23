@@ -59,7 +59,7 @@ class _DocRef:
             cur.clear()
             cur.update(data)
 
-    async def get(self):
+    async def get(self, transaction=None):
         return _Snap(self.id, self.db.get(self.coll, {}).get(self.id))
 
     async def delete(self):
@@ -83,6 +83,27 @@ class FakeDb:
 
     def collection(self, name):
         return _Coll(self.db, name)
+
+    async def transaction(self, runner):
+        """Firestore-style transaction: read during the runner, writes applied
+        at commit (after the precondition checks have run)."""
+
+        class _Tx:
+            def __init__(self):
+                self.ops = []
+
+            def set(self, ref, data, merge=False):
+                self.ops.append((ref, data, merge))
+
+        tx = _Tx()
+        await runner(tx)
+        for ref, data, merge in tx.ops:
+            cur = self.db.setdefault(ref.coll, {}).setdefault(ref.id, {})
+            if merge:
+                cur.update(data)
+            else:
+                cur.clear()
+                cur.update(data)
 
 
 class _FakeResponse:
@@ -645,9 +666,12 @@ def test_confirm_lifecycle_draft_to_scheduled():
         )
     )["draft_id"]
     out = asyncio.run(
-        _handle_confirm_reminder({"reminder_id": draft_id}, store, now_s=NOW_S)
+        _handle_confirm_reminder({"reminder_id": draft_id}, store, None, now_s=NOW_S)
     )
-    assert out["result"] == "Reminder confirmed."
+    assert out["result"] == (
+        "Reminder confirmed. (scheduling backend not configured)"
+    )
+    assert out["task_scheduled"] is False
     assert store.reminders[draft_id]["status"] == "scheduled"
 
 
@@ -755,7 +779,8 @@ def test_reminder_tools_register_with_gate(monkeypatch):
     confirmed = asyncio.run(
         reg.dispatch("confirm_reminder", {"reminder_id": created["draft_id"]})
     )
-    assert confirmed["result"] == "Reminder confirmed."
+    assert confirmed["task_scheduled"] is False  # no SIRIOUS_TASKS_* in tests
+    assert "Reminder confirmed." in confirmed["result"]
     outcomes = [e["outcome"] for e in audit.entries]
     assert outcomes.count("ok") == 2
 
@@ -802,3 +827,272 @@ def test_main_has_no_prompt_time_injection():
     src = inspect.getsource(main_mod)
     assert "time_context" not in src
     assert "Current date and time" not in src
+
+
+# ── Chunk 2: scheduling backends ─────────────────────────────────────────────
+
+class FakeScheduler:
+    """Records schedule/cancel calls; optionally explodes."""
+
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.scheduled = []
+        self.cancelled = []
+
+    async def schedule(self, reminder_id, due_ts):
+        if self.fail:
+            raise RuntimeError("tasks API down")
+        self.scheduled.append((reminder_id, due_ts))
+        return f"projects/p/queues/q/tasks/rem-{reminder_id}"
+
+    async def cancel(self, task_name):
+        self.cancelled.append(task_name)
+
+
+def test_cloudtasks_task_name_is_deterministic():
+    sched = tools_mod.CloudTasksScheduler(
+        queue_path="projects/p/locations/l/queues/q",
+        target_url="https://x.example/internal/fire-reminder",
+        oidc_service_account="sa@proj.iam.gserviceaccount.com",
+    )
+    n1 = sched._task_name("abc", 1_800_000_000.4)
+    n2 = sched._task_name("abc", 1_800_000_000.9)
+    assert n1 == n2                      # sub-second truncation is stable
+    assert n1.startswith("projects/p/locations/l/queues/q/tasks/rem-abc-")
+
+
+def test_confirm_with_scheduler_schedules_and_stores_task_name():
+    store = InMemoryReminderStore()
+    fake = FakeScheduler()
+    draft_id = asyncio.run(
+        _handle_create_reminder(
+            {"text": "x", "due_at": _due(24)}, store, "d", now_s=NOW_S
+        )
+    )["draft_id"]
+    out = asyncio.run(
+        _handle_confirm_reminder(
+            {"reminder_id": draft_id}, store, fake, now_s=NOW_S
+        )
+    )
+    assert out["task_scheduled"] is True and "not configured" not in out["result"]
+    assert fake.scheduled[0][0] == draft_id
+    assert store.reminders[draft_id]["task_name"].endswith(draft_id)
+    assert store.reminders[draft_id]["status"] == "scheduled"
+
+
+def test_scheduler_failure_reverts_to_draft():
+    """Scheduling failure must NOT strand the reminder as 'scheduled' with no
+    task behind it — the user's yes stays a re-confirmable draft instead."""
+    store = InMemoryReminderStore()
+    fake = FakeScheduler(fail=True)
+    draft_id = asyncio.run(
+        _handle_create_reminder(
+            {"text": "x", "due_at": _due(24)}, store, "d", now_s=NOW_S
+        )
+    )["draft_id"]
+    out = asyncio.run(
+        _handle_confirm_reminder(
+            {"reminder_id": draft_id}, store, fake, now_s=NOW_S
+        )
+    )
+    assert out == {"error": "could not schedule the reminder right now"}
+    assert store.reminders[draft_id]["status"] == "draft"
+
+
+def test_cancel_deletes_live_task_before_status_flip():
+    store = InMemoryReminderStore()
+    fake = FakeScheduler()
+    draft_id = asyncio.run(
+        _handle_create_reminder(
+            {"text": "x", "due_at": _due(24)}, store, "d", now_s=NOW_S
+        )
+    )["draft_id"]
+    asyncio.run(
+        _handle_confirm_reminder({"reminder_id": draft_id}, store, fake, now_s=NOW_S)
+    )
+    out = asyncio.run(_handle_cancel_reminder({"reminder_id": draft_id}, store, fake))
+    assert out["result"] == "Reminder cancelled."
+    assert fake.cancelled == [
+        store.reminders[draft_id]["task_name"]
+    ]
+
+
+# ── Chunk 2: fire path (guards + idempotency + endpoint) ────────────────────
+
+def test_fire_guard_rejects_wrong_states():
+    from app.tools import _fire_allowed
+
+    due = NOW_S - 10  # just past due → in grace window
+    assert _fire_allowed({"status": "scheduled", "due_ts": due}, now_s=NOW_S) is None
+    assert "duplicate" in _fire_allowed({"status": "fired"}, now_s=NOW_S)
+    assert "not schedulable" in _fire_allowed(
+        {"status": "cancelled", "due_ts": due}, now_s=NOW_S
+    )
+    early = NOW_S + tools_mod.FIRE_GRACE_S + 60
+    assert "early" in _fire_allowed(
+        {"status": "scheduled", "due_ts": early}, now_s=NOW_S
+    )
+    assert "unparsable" in _fire_allowed(
+        {"status": "scheduled", "due_ts": "junk"}, now_s=NOW_S
+    )
+
+
+def test_process_fired_reminder_happy_path_and_push():
+    store = InMemoryReminderStore()
+    draft_id = asyncio.run(
+        _handle_create_reminder(
+            {"text": "call Raj back", "due_at": _due(24)}, store, "d", now_s=NOW_S
+        )
+    )["draft_id"]
+    asyncio.run(_handle_confirm_reminder({"reminder_id": draft_id}, store))
+
+    pushes = []
+    status, body = asyncio.run(
+        tools_mod.process_fired_reminder(
+            draft_id,
+            store,
+            push_send=lambda t, d: pushes.append((t, d)),
+            # Fire just PAST due (within the late-fire tolerance).
+            now_s=NOW_S + 24 * 3600 + 10,
+        )
+    )
+    assert status == 200 and body["result"] == "fired"
+    assert body["push_sent"] is True
+    assert len(pushes) == 1 and pushes[0][0] == "call Raj back"
+    assert store.reminders[draft_id]["status"] == "fired"
+
+    # Retry of the same fire → suppressed, still 2xx so Cloud Tasks stops.
+    status2, body2 = asyncio.run(
+        tools_mod.process_fired_reminder(draft_id, store, push_send=None,
+                                         now_s=NOW_S + 24 * 3600 + 10)
+    )
+    assert status2 == 200 and body2["result"] == "already fired"
+    assert len(store.reminders) == 1
+
+
+def test_process_fired_reminder_cancelled_swallows_with_2xx():
+    """Cancel raced ahead of the fire → the task must be swallowed with 2xx
+    or Cloud Tasks would retry forever against a cancelled reminder."""
+    store = InMemoryReminderStore()
+    draft_id = asyncio.run(
+        _handle_create_reminder(
+            {"text": "x", "due_at": _due(24)}, store, "d", now_s=NOW_S
+        )
+    )["draft_id"]
+    store.reminders[draft_id]["status"] = "scheduled"
+    asyncio.run(_handle_cancel_reminder({"reminder_id": draft_id}, store))
+    status, body = asyncio.run(
+        tools_mod.process_fired_reminder(draft_id, store, now_s=NOW_S + 100)
+    )
+    assert status == 200 and "not schedulable" in body["result"]
+
+
+def test_process_fired_reminder_unknown_and_early():
+    store = InMemoryReminderStore()
+    status, _ = asyncio.run(
+        tools_mod.process_fired_reminder("ghost", store, now_s=NOW_S)
+    )
+    assert status == 404
+
+    # Early fire (beyond grace) → 409 so Cloud Tasks' own retry policy runs;
+    # by then it won't be early any more.
+    rid = asyncio.run(store.create_draft(
+        text="t", due_ts=NOW_S + 9999, due_iso=_due(3), doc_id="d",
+        created_at="2027-01-15T04:30:00+00:00",
+    ))
+    asyncio.run(store.set_status(rid, "scheduled"))
+    status2, body2 = asyncio.run(
+        tools_mod.process_fired_reminder(rid, store, now_s=NOW_S)
+    )
+    assert status2 == 409 and "early" in body2["error"]
+
+
+def test_fire_endpoint_auth_and_flow(monkeypatch):
+    """FastAPI TestClient against the real route: token checks, then a full
+    scheduled→fired flow through the endpoint with OIDC verification stubbed
+    (crypto-level token tests belong to google-auth)."""
+    from fastapi.testclient import TestClient
+    from app import main as main_mod
+    from app.tools import ReminderStore
+
+    monkeypatch.setenv("SIRIOUS_FIRE_URL", "https://svc.example/internal/fire-reminder")
+    monkeypatch.delenv("SIRIOUS_AUTH_TOKEN", raising=False)
+
+    # Seed a Firestore-fake-backed store and route the endpoint to it BEFORE
+    # any request — no test path may touch real Firestore ADC.
+    fake_db = FakeDb()
+    real_store = tools_mod.ReminderStore()
+    real_store._ensure_db = lambda: fake_db
+    monkeypatch.setattr(main_mod, "get_reminder_store", lambda: real_store)
+
+    client = TestClient(main_mod.app)
+
+    # Unconfigured service → 503 before anything else.
+    monkeypatch.setattr(main_mod, "FIRE_AUDIENCE", "")
+    r0 = client.post("/internal/fire-reminder", json={"reminder_id": "x"})
+    assert r0.status_code == 503
+
+    monkeypatch.setattr(
+        main_mod, "FIRE_AUDIENCE", "https://svc.example/internal/fire-reminder"
+    )
+
+    # Missing header → 401; bad token → 401 (verifier stubbed: crypto-level
+    # token tests belong to google-auth).
+    r1 = client.post("/internal/fire-reminder", json={"reminder_id": "x"})
+    assert r1.status_code == 401
+    monkeypatch.setattr(
+        main_mod, "verify_tasks_oidc", lambda tok, aud: ("signer@sa.iam", "")
+    )
+    r2 = client.post(
+        "/internal/fire-reminder",
+        json={"reminder_id": "ghost"},
+        headers={"X-Goog-Iap-Jwt-Assertion": "tok"},
+    )
+    assert r2.status_code == 404  # authenticated, unknown reminder
+
+    # Real flow through the endpoint on the fake store. Seed due/created on
+    # the REAL clock: process_fired_reminder inside main.py uses time.time().
+    import time as _t
+    real_now = _t.time()
+    rid = asyncio.run(real_store.create_draft(
+        text="tea with Amma", due_ts=real_now - 5,
+        due_iso=datetime.fromtimestamp(real_now - 5, tz=timezone.utc).isoformat(),
+        doc_id="conv-x",
+        created_at=datetime.fromtimestamp(real_now, tz=timezone.utc).isoformat(),
+    ))
+    asyncio.run(real_store.set_status(rid, "scheduled"))
+
+    r3 = client.post(
+        "/internal/fire-reminder",
+        json={"reminder_id": rid},
+        headers={"X-Goog-Iap-Jwt-Assertion": "tok"},
+    )
+    assert r3.status_code == 200
+    assert r3.json()["result"] == "fired"
+    assert fake_db.db[tools_mod.REMINDERS_COLLECTION][rid]["status"] == "fired"
+
+    # Duplicate delivery → suppressed duplicate, still 200.
+    r4 = client.post(
+        "/internal/fire-reminder",
+        json={"reminder_id": rid},
+        headers={"X-Goog-Iap-Jwt-Assertion": "tok"},
+    )
+    assert r4.status_code == 200 and r4.json()["result"] == "already fired"
+
+
+def test_verify_tasks_oidc_rejects_bad_issuer(monkeypatch):
+    """Issuer check runs on successfully-decoded claims — a token signed by
+    Google but minted for something else must not pass."""
+    import google.auth.jwt as google_jwt
+
+    captured = {}
+
+    def fake_decode(token, certs_url=None, audience=None):
+        captured["audience"] = audience
+        return {"iss": "https://evil.example", "email_verified": True,
+                "email": "attacker@example.com"}
+
+    monkeypatch.setattr(google_jwt, "decode", fake_decode)
+    email, err = tools_mod.verify_tasks_oidc("any-token", "https://aud")
+    assert email is None and err == "unexpected issuer"
+    assert captured["audience"] == "https://aud"

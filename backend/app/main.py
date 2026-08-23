@@ -9,12 +9,18 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi import Depends, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
 from .store import get_store
 from .memory import get_memory_store
-from .tools import build_registry
+from .tools import (
+    build_registry,
+    get_reminder_store,
+    process_fired_reminder,
+    verify_tasks_oidc,
+)
 
 
 app = FastAPI()
@@ -236,6 +242,49 @@ async def delete_session(
 
     log_event("rest", "session_deleted", doc_id=doc_id, **stats)
     return {"deleted": True, "id": doc_id, "memories": stats}
+
+
+# ── Reminder firing (Phase 4 chunk 2) ────────────────────────────────────────
+# Cloud Tasks one-shot tasks hit this endpoint at each reminder's due instant
+# carrying an OIDC ID token minted by SIRIOUS_FIRE_OIDC_SA. Auth is the token,
+# not the bearer token: only our scheduler can reach this route.
+
+FIRE_AUDIENCE = os.environ.get("SIRIOUS_FIRE_URL", "")
+
+
+class _FireRequest(BaseModel):
+    reminder_id: str
+
+
+@app.post("/internal/fire-reminder")
+async def fire_reminder(
+    request: _FireRequest,
+    x_goog_iap_jwt_assertion: str | None = Header(default=None),
+):
+    """Cloud Tasks → here. Verifies the OIDC token (audience must equal
+    SIRIOUS_FIRE_URL), then process_fired_reminder does the idempotent
+    scheduled→fired flip and dispatches the push. 2xx stops retries."""
+    if not FIRE_AUDIENCE:
+        return JSONResponse(status_code=503, content={"detail": "fire path not configured"})
+    if not x_goog_iap_jwt_assertion:
+        return JSONResponse(status_code=401, content={"detail": "missing task token"})
+    email, err = verify_tasks_oidc(x_goog_iap_jwt_assertion, FIRE_AUDIENCE)
+    if err:
+        log_event("fire", "fire_auth_rejected", error=err)
+        return JSONResponse(status_code=401, content={"detail": err})
+    log_event("fire", "fire_authenticated", signer=email)
+
+    status, body = await process_fired_reminder(
+        request.reminder_id, get_reminder_store()
+    )
+    log_event(
+        "fire",
+        "reminder_fired",
+        reminder_id=request.reminder_id,
+        http=status,
+        **{"result": body.get("result", body.get("error", ""))},
+    )
+    return JSONResponse(status_code=status, content=body)
 
 
 @app.websocket("/ws")
