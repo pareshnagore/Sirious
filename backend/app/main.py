@@ -20,6 +20,7 @@ from .tools import (
     get_reminder_store,
     process_fired_reminder,
     verify_tasks_oidc,
+    _scheduler_from_env,
 )
 
 
@@ -285,6 +286,36 @@ async def fire_reminder(
         **{"result": body.get("result", body.get("error", ""))},
     )
     return JSONResponse(status_code=status, content=body)
+
+
+@app.post("/internal/reminders/selftest")
+async def reminders_selftest(_: None = Depends(require_auth)):
+    """Chunk-2 prod probe: seeds a scheduled reminder due +2 min and creates
+    the real Cloud Tasks task via the same scheduler confirm_reminder uses.
+    Bearer-auth like every other REST route. Watch it land on
+    /internal/fire-reminder ~2 minutes later."""
+    import time as _t
+
+    store = get_reminder_store()
+    scheduler = _scheduler_from_env()
+    now = _t.time()
+    rid = await store.create_draft(
+        text="chunk2 prod probe — scheduling works end to end",
+        due_ts=now + 120,
+        due_iso=datetime.fromtimestamp(now + 120, tz=timezone.utc).isoformat(),
+        doc_id="probe-selftest",
+        created_at=datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+    )
+    await store.set_status(rid, "scheduled")
+    task_name = await scheduler.schedule(rid, now + 120)
+    await store.set_task(rid, task_name)
+    log_event("fire", "selftest_scheduled", reminder_id=rid, task=task_name or "")
+    return {
+        "reminder_id": rid,
+        "task_scheduled": task_name is not None,
+        "task_name": task_name,
+        "note": "poll Firestore for status=fired in ~2-3 min",
+    }
 
 
 @app.websocket("/ws")
