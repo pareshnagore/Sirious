@@ -179,7 +179,11 @@ def send_push(
             detail = e.read().decode("utf-8", errors="replace")[:300]
         except Exception:  # noqa: BLE001
             pass
-        if e.code == 404 or "UNREGISTERED" in detail or "NOT_FOUND" in detail:
+        if e.code == 404 or "UNREGISTERED" in detail:
+            return False, "unregistered"
+        if e.code == 400 and "not a valid FCM registration token" in detail:
+            # Malformed/garbage token (bad registration, not a real device).
+            # Treat like unregistered so the registry self-cleans.
             return False, "unregistered"
         log.warning("FCM send failed %s: %s", e.code, detail)
         return False, f"http_{e.code}"
