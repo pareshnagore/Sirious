@@ -22,6 +22,10 @@ from .tools import (
     verify_tasks_oidc,
     _scheduler_from_env,
 )
+from .fcm import (
+    DeviceTokenStore,
+    deliver_reminder_to_all_devices,
+)
 
 
 app = FastAPI()
@@ -290,7 +294,16 @@ async def fire_reminder(
     log_event("fire", "fire_authenticated", signer=email)
 
     status, body = await process_fired_reminder(
-        request.reminder_id, get_reminder_store()
+        request.reminder_id,
+        get_reminder_store(),
+        # Chunk 3: real FCM delivery. Runs after the idempotent flip, so a
+        # push failure can never cause a Cloud Tasks retry of a fired
+        # reminder; dead tokens are pruned on UNREGISTERED.
+        push_send=lambda text, data: deliver_reminder_to_all_devices(
+            text,
+            data.get("reminder_id", ""),
+            get_device_token_store(),
+        ),
     )
     log_event(
         "fire",
@@ -330,6 +343,45 @@ async def reminders_selftest(_: None = Depends(require_auth)):
         "task_name": task_name,
         "note": "poll Firestore for status=fired in ~2-3 min",
     }
+
+
+# ── FCM device registration (chunk 3) ────────────────────────────────────────
+# The Android app POSTs its FCM token here after Firebase init at startup.
+
+_device_tokens_singleton: DeviceTokenStore | None = None
+
+
+def get_device_token_store() -> DeviceTokenStore:
+    global _device_tokens_singleton
+    if _device_tokens_singleton is None:
+        _device_tokens_singleton = DeviceTokenStore()
+    return _device_tokens_singleton
+
+
+class _DeviceRegisterRequest(BaseModel):
+    token: str
+
+
+@app.post("/devices/register")
+async def register_device(
+    request: _DeviceRegisterRequest,
+    _: None = Depends(require_auth),
+):
+    """Register/refresh this device's FCM token (bearer-auth)."""
+    doc_id = await get_device_token_store().register(request.token)
+    log_event("fcm", "device_registered", doc=doc_id[:12])
+    return {"registered": True, "id": doc_id[:12]}
+
+
+@app.post("/devices/unregister")
+async def unregister_device(
+    request: _DeviceRegisterRequest,
+    _: None = Depends(require_auth),
+):
+    """Remove a device's FCM token (bearer-auth; e.g. app logout/wipe)."""
+    await get_device_token_store().remove(request.token)
+    log_event("fcm", "device_unregistered")
+    return {"removed": True}
 
 
 @app.websocket("/ws")
