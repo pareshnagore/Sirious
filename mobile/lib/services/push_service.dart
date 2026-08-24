@@ -64,8 +64,9 @@ class PushService {
   /// POST the FCM token to the backend (bearer-auth like all REST).
   static Future<bool> registerToken(String token) async {
     try {
+      // SAME KEY AuthService uses (mobile/lib/services/auth_service.dart).
       const storage = FlutterSecureStorage();
-      final authToken = await storage.read(key: 'auth_token') ?? '';
+      final authToken = await storage.read(key: 'sirious_api_token') ?? '';
       final resp = await http.post(
         Uri.parse('${AppConfig.apiBase}/devices/register'),
         headers: {
