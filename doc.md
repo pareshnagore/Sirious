@@ -123,16 +123,23 @@ backend/
   app/memory.py                Phase 3 memory: extraction, embeddings, dedup,
                                retrieval, /memories backing (same queue+writer pattern)
   app/tools.py                 Phase 4 tool registry: declarations, handlers,
-                               gating (SIRIOUS_TOOLS/TAVILY_API_KEY), dispatch,
-                               per-call audit (tool_audit), web_search + add_note
+                               gating (SIRIOUS_TOOLS/TAVILY_API_KEY/
+                               SIRIOUS_REMINDERS), dispatch, per-call audit,
+                               web_search + add_note + reminders (draft/
+                               confirm/cancel, server-side NL time resolve,
+                               Cloud Tasks scheduling)
+  app/fcm.py                   FCM push: device_tokens registry (self-pruning),
+                               raw HTTP v1 send via ADC, reminder fanout
   docs/websocket_protocol.md   wire protocol v2 (authoritative)
   recall_test.py               Phase 3 north-star recall harness (edge-tts E2E)
-  requirements.txt             pinned deps (google-genai==2.19.0)
+  requirements.txt             pinned deps (google-genai==2.19.0, google-cloud-tasks,
+                               pyjwt, tzdata)
 mobile/
   lib/services/                controller, WS client, audio capture/playback,
-                               history_api, memory_api
+                               history_api, memory_api, push_service (FCM)
   lib/ui/                      voice session, history, transcript detail, memories
-  android/                     Gradle 9.3.1 / AGP 9.1.0 / Kotlin 2.4.0
+  android/                     Gradle 9.3.1 / AGP 9.1.0 / Kotlin 2.4.0,
+                               google-services plugin + google-services.json
 product_phases.md              phase plan + live progress (source of truth)
 doc.md                         this file
 ```
@@ -181,9 +188,12 @@ History/search UI                                ✅ Phase 2 (list + transcript 
 Transcript-replay fallback (resume expired)      ✅ Phase 2 (live-verified 22 Aug)
 Auth                                             ✅ Phase 2 (bearer token, REST + WS)
 Long-term memory                                 ✅ Phase 3 done 22 Aug 2026 (recall PASS, user-accepted)
-Tools / actions                                  🟡 Phase 4 v1 live 23 Aug 2026 (registry,
-                                                 web_search via Tavily, add_note, audit log —
-                                                 prod-proven; reminders next via FCM+Cloud Tasks)
+Tools / actions                                  ✅ Phase 4 COMPLETE 24 Aug 2026
+                                                 (registry, web_search via Tavily,
+                                                 add_note, audit log, reminders
+                                                 end-to-end: voice draft→confirm→
+                                                 Cloud Tasks→FCM push — verified
+                                                 on device)
 ```
 
 ---
@@ -193,7 +203,7 @@ Tools / actions                                  🟡 Phase 4 v1 live 23 Aug 202
 Phased plan with scope-in/scope-out lives in `product_phases.md`. Shape of the road:
 
 * **Phase 3 — Contextual memory:** extraction pipeline over transcripts → episodic/semantic/entity/task memories. Never store raw transcripts as memory. The Phase 2 Firestore store is the raw material.
-* **Phase 4 (v1 done 23 Aug 2026)** — tools & actions: server-side tool registry (`app/tools.py`); `web_search` (Tavily, provider-swappable) and `add_note` (Firestore) behind one generic dispatcher with a per-call audit log (`tool_audit`); confirmation scaffold (`requires_confirmation`) for future destructive tools; system-instruction tool hints. Both tools live-proven in prod (structured logs + spoken answers). Reminders deliberately deferred — direction agreed: FCM push + Cloud Tasks one-shot scheduling.
+* **Phase 4 (COMPLETE 24 Aug 2026)** — tools & actions: server-side tool registry (`app/tools.py`); `web_search` (Tavily, provider-swappable) and `add_note` (Firestore) behind one generic dispatcher with a per-call audit log (`tool_audit`); confirmation scaffold for future destructive tools; **reminders end-to-end** — `create_reminder` takes the user's own words ("friday morning"), resolved server-side in Asia/Kolkata (no timestamps in the prompt → stable prefix, no stale clocks); spoken confirm → `confirm_reminder` schedules a one-shot Cloud Tasks HTTPS task (deterministic names); fire lands on `/internal/fire-reminder` (OIDC-verified, idempotent via Firestore transaction) → FCM push to registered devices (`device_tokens`, self-pruning) → tray notification on the phone, on-device verified. Temporal grounding via `get_current_time` tool.
 * **Phase 5+ — ambient/multi-speaker, people recognition, deeper agentic behavior.** The voice interface becomes the front door to an agent, not the agent itself.
 
 Layering principle (unchanged since the start): transport → conversation management → client UX → persistence → memory → tools → autonomy. Build in order; don't merge layers prematurely.
@@ -202,4 +212,4 @@ Layering principle (unchanged since the start): transport → conversation manag
 
 # 10. One-line status
 
-> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity, persistent history, contextual memory with agentic recall, AND its first real tools (web search, notes — audited) in production — Phase 4 v1 live 23 Aug 2026; next: on-device verification, then reminders (FCM + Cloud Tasks).**
+> **Sirious is a working, interruptible, blip-resilient voice assistant on Android with session continuity, persistent history, contextual memory with agentic recall, and real tools in production — web search, notes, and end-to-end reminders (voice → Cloud Tasks → FCM push to the phone, on-device verified). Phase 4 complete 24 Aug 2026.**
