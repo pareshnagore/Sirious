@@ -41,6 +41,8 @@ dependencies:
   path_provider: ^2.1.6
   http: ^1.5.0
   flutter_secure_storage: ^9.2.4
+  firebase_core: ^4.2.0
+  firebase_messaging: ^16.0.3
 
 dev_dependencies:
   flutter_test:
