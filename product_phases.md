@@ -74,7 +74,7 @@ Product phases span multiple layers. A single product phase may complete parts o
 ❌ Reminders (FCM + Cloud Tasks — direction agreed), multi-speaker, vision
 ```
 
-**Active focus:** Phase 4 v1 + reminders chunks 1–3 DEPLOYED and prod-verified (rev 00042): voice draft→confirm→Cloud Tasks→fire→FCM fanout, all idempotent. Chunk 4 (Android FCM client) built — APK ready, needs on-device install+verify when Paresh's back. Then: notes retrieval design, Phase 5.
+**Active focus:** Phase 4 COMPLETE — tools v1 + reminders end-to-end, ON-DEVICE VERIFIED 24 Aug (voice draft→confirm→Cloud Tasks→OIDC fire→FCM→tray notification + badge). Next: notes-retrieval design (parked), Phase 5 planning.
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -641,6 +641,28 @@ Sirious: [ searches, summarizes verbally ]
    rendering on device. Checklist for Paresh: adb install -r new APK →
    open app once (auto-registers token, asks notification permission) →
    voice "remind me to X in 5 minutes" → confirm → expect push ~5 min.
+```
+
+#### Reminders — ON-DEVICE VERIFIED (24 Aug 2026, Paresh back) — Phase 4 COMPLETE
+
+```text
+✅ Release APK installed via adb install -r (keystore signature matched —
+   secure storage/token preserved; NOTE: debug-signed build can't update
+   the release install, INSTALL_FAILED_UPDATE_INCOMPATIBLE).
+✅ Real FCM token registered to /devices/register → device_tokens doc live.
+❗On-device lesson: PushService initially read secure-storage key
+   'auth_token' but AuthService stores 'sirious_api_token' → registration
+   401'd silently. Fixed, rebuilt, reinstalled (commit 0c3ac4d).
+✅ Push rendered on device: FCM send → tray notification + app-icon badge
+   confirmed via dumpsys NotificationRecord (pkg=com.sirious.sirious,
+   FCM-Notification) + screenshot showing badge "1" on the Sirious icon.
+⚠️ Known behavior (deferred polish): app FOREGROUND → FCM hands the
+   message to onMessage (debugPrint only, no tray render) — by design;
+   background/terminated renders fine. UI toast for foreground is later.
+✅ FULL CHAIN NOW PROVEN: voice draft → confirm → Cloud Tasks → fire
+   endpoint (OIDC) → FCM → phone notification.
+Remaining for Phase 4: Paresh's natural voice test ("remind me to X in 5
+minutes" → confirm → push). Then: notes-retrieval design (parked), Phase 5.
 ```
 
 #### Deployment notes (learned the hard way)
