@@ -74,7 +74,7 @@ Product phases span multiple layers. A single product phase may complete parts o
 ❌ Reminders (FCM + Cloud Tasks — direction agreed), multi-speaker, vision
 ```
 
-**Active focus:** Phase 4 v1 (registry + web_search + add_note + audit) deployed 23 Aug (rev 00030) and live-verified. Reminders chunks 1+2 DEPLOYED (rev 00040): draft→confirm→schedule via Cloud Tasks one-shot HTTPS tasks, OIDC-verified fire endpoint, idempotent firing — prod-verified end-to-end. Remaining in Phase 4: chunk 3 FCM push (Firebase Admin + device_tokens), chunk 4 Android client, voice verification.
+**Active focus:** Phase 4 v1 + reminders chunks 1–3 DEPLOYED and prod-verified (rev 00042): voice draft→confirm→Cloud Tasks→fire→FCM fanout, all idempotent. Chunk 4 (Android FCM client) built — APK ready, needs on-device install+verify when Paresh's back. Then: notes retrieval design, Phase 5.
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -609,6 +609,38 @@ Sirious: [ searches, summarizes verbally ]
 ⚠️ Remaining: chunk 3 (Firebase Admin FCM send + device_tokens
    registration), chunk 4 (Android client: google-services.json, FCM
    service, notification UI), Paresh's voice verification of reminders.
+```
+
+#### Reminders — chunks 3+4 built + DEPLOYED + prod-verified (24 Aug 2026)
+
+```text
+✅ Firebase provisioned via API (no console): addFirebase on sirious-2026,
+   Android app com.sirious.sirious registered, google-services.json fetched
+   + decoded into mobile/android/app/.
+✅ backend/app/fcm.py (chunk 3): DeviceTokenStore (Firestore
+   device_tokens/{sha256(token)} — re-register overwrites, never dups);
+   send_push = raw FCM HTTP v1 via ADC OAuth2 (google.auth, NO
+   firebase-admin dep), urllib inside asyncio.to_thread;
+   deliver_reminder_to_all_devices fans out + prunes dead tokens.
+   UNREGISTERED (404) AND 400 "not a valid FCM registration token" both
+   count as dead (rev 00041 lesson).
+✅ main.py: POST /devices/register + /devices/unregister (bearer-auth);
+   fire endpoint passes real push_send after the idempotent flip — push
+   failure can never cause a retry of an already-fired reminder.
+✅ Android (chunk 4): settings/app gradle.kts += google-services 4.4.2;
+   pubspec += firebase_core 4.13 / firebase_messaging 16.5; PushService
+   (init before runApp fire-and-forget, POST_NOTIFICATIONS request, token
+   fetch + onTokenRefresh → /devices/register with bearer token from
+   secure storage, top-level background handler). analyze clean, widget
+   test pass, debug APK builds. NOT installed yet — phone was away;
+   when back: adb install -r (NOT flutter install — wipes secure storage).
+✅ Prod probe rev 00042 PASS: register fake token → selftest → fired on
+   time → FCM 400 invalid-token → device doc auto-pruned (404). Full
+   schedule→fire→fanout→prune chain exercised live.
+⏳ Unverifiable without phone: real FCM token registration + notification
+   rendering on device. Checklist for Paresh: adb install -r new APK →
+   open app once (auto-registers token, asks notification permission) →
+   voice "remind me to X in 5 minutes" → confirm → expect push ~5 min.
 ```
 
 #### Deployment notes (learned the hard way)
