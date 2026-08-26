@@ -71,10 +71,16 @@ Product phases span multiple layers. A single product phase may complete parts o
 ✅ Tools & actions v1 (Phase 4, 23 Aug 2026): server-side tool registry,
    web_search (Tavily) + add_note (Firestore), per-call audit log —
    both tools live-proven in prod (structured logs + spoken answers)
-❌ Reminders (FCM + Cloud Tasks — direction agreed), multi-speaker, vision
+✅ Reminders end-to-end (Phase 4 closed 24 Aug): voice draft→confirm→
+   Cloud Tasks→OIDC fire→FCM→tray notification+badge, on-device verified
+❌ Multi-speaker (Phase 5 — started 25 Aug 2026), vision
 ```
 
-**Active focus:** Phase 4 COMPLETE — tools v1 + reminders end-to-end, ON-DEVICE VERIFIED 24 Aug (voice draft→confirm→Cloud Tasks→OIDC fire→FCM→tray notification + badge). Next: notes-retrieval design (parked), Phase 5 planning.
+**Active focus:** **Phase 5 IN PROGRESS (started 25 Aug 2026)** — ambient & multi-speaker
+mode. Architecture agreed: side-STT ambient (NOT always-on Gemini), ducking for answer
+time, Google STT v2 (Marathi-capable streaming) as launch provider behind a provider
+interface. Working plan + fork alternatives in the Phase 5 section below; echo/barge-in
+research in `docs/echo_bargein_research.md`.
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -695,49 +701,204 @@ Gemini Live remains the **voice front door**. Tools run in a **server-side agent
 
 ---
 
-## Phase 5 — Ambient & multi-speaker mode (MUCH LATER)
+## Phase 5 — Ambient & multi-speaker mode (IN PROGRESS — started 25 Aug 2026)
 
 ### Goal
 
 Phone on table during a **group conversation**; Sirious listens to multiple people and helps when asked — closer to the original "assistant in the room" vision.
 
+### Agreed architecture (25 Aug 2026, supersedes the original open questions)
+
+**Side-STT ambient, NOT always-on Gemini.** In ambient mode the mic streams to a
+dedicated STT+diarization provider; Gemini Live is connected ONLY on invocation.
+Why: (1) Gemini Live cannot diarize — speaker labels are the product; (2) silence
+becomes structural (nothing in the room CAN talk) instead of instruction-hoped;
+(3) hours of chatter never pollute Gemini's context; (4) transcription-priced cost.
+
+```text
+                       ┌─────────────────────────────────────────┐
+                       │              PHONE (mic)                │
+                       └───────────────┬─────────────────────────┘
+                                       │ far-field profile (see device facts)
+               ┌───────────────────────┴───────────────────────┐
+               │            AMBIENT MODE (C1)                  │
+               │   mic ──► STT vendor (streaming WS)           │
+               │              └─► diarized turns "S1: …"       │
+               │              ──► Firestore ──► History UI     │
+               │              ──► invocation spotter (C2)      │
+               └───────────────────────┬───────────────────────┘
+                    "Sirious" spotted in transcript
+                                       │
+               ┌───────────────────────┴───────────────────────┐
+               │         INVOCATION (reuses Phases 0–4)        │
+               │  hot-start Gemini Live seeded with recent     │
+               │  transcript tail ──► answers OUT LOUD         │
+               │  ──► ducked capture while speaking (C2.5) ──► │
+               │      back to ambient                          │
+               └───────────────────────────────────────────────┘
+```
+
+Normal 1:1 mode (earphones, Gemini Live, Phases 0–4 behavior) is the default and stays
+byte-for-byte unchanged.
+
+**Provider decision — REVISED after probes (25 Aug 2026, probes e0bbbd2):**
+Google STT v2 **cannot deliver diarization on our path**. Exhaustive matrix
+(sync recognize / streaming / batch × chirp_3/long/short/latest_* × global/us/
+asia-south1 × en-IN+hi-IN/en-US) → three distinct rejections: sync recognize =
+"Recognize does not support Speaker Diarization for the requested model";
+streaming = "Recognizer does not support feature: speaker_diarization" (en-US
+control too — NOT locale-gating); batch en-US = "Diarization is not currently
+supported"; batch chirp_3@us accepted the config but returned EMPTY transcripts
+twice. Also learned: chirp_3 exists only in `us`+`asia-south1` (not `global`),
+en-IN chirp_3 is allowlist-gated (403 "no longer generally available"), and
+feature support is evaluated against the recognizer's OWN model — per-request
+model overrides don't count. CONSEQUENCE: Google demoted to fallback
+(transcription-only, no diarization). **Launch provider reverts to the original
+shortlist: Deepgram (streaming diarization, $200 free credit, no card) or
+AssemblyAI (streaming diarization + code-switching, $50 credit) — Paresh to
+create accounts and hand over keys.** Marathi caveat: neither streams Marathi;
+home Marathi use (small) would need batch or stays on Gemini-only 1:1.
+The SttProvider interface + smoke/probe scripts remain valid; only the
+GoogleSttProvider's launch role changed. Data-logging/consent points moot for
+Google unless it returns as fallback.
+
 ### User experience
 
 ```text
-[Friends talking at table. Phone face-up, Sirious listening.]
+[Phone face-up on table, ambient toggle ON, recording indicator shown]
 
 Friend: "...what's the longest train in the world?"
 User:  "Sirious, can you answer that?"
 Sirious: "The longest regularly scheduled passenger train is..."
+         [capture ducked while speaking, then back to ambient]
+
+Later, History shows: S1: ... / S2: ... / S1: ...   (long-press → name a speaker)
 ```
+
+### Chunked working plan (each chunk independently testable)
+
+**C0.5 — Device & audio ground truth — DONE 25 Aug 2026**
+- Probed live session: AEC + NoiseSuppression genuinely attach (audio_flinger);
+  AGC NOT available on SM-E346B (logcat "Auto gain effect is not available");
+  audio source resolves to MIC (not DEFAULT).
+- Echo experiment (voiceCommunication + MODE_IN_COMMUNICATION + speakerphone):
+  FAILED — Samsung call pipeline hard-gates uplink during playback (digital
+  silence, barge-in onset peak=0/floor=0) AND Sirious's own speech leaked through
+  playback gaps as ghost user turns. Reverted same day. Full-duplex via call
+  pipeline is DEAD on this device. Details: audio_capture_service.dart comment +
+  docs/echo_bargein_research.md + sirious-build skill.
+- Consequence: answer-time strategy is DUCKING (no exceptions); ambient mode needs
+  no echo handling at all (nothing plays).
+
+**C1 — Ambient plumbing — backend DONE 26 Aug 2026 (rev 00043, prod-verified)**
+- Backend: SttProvider interface + DeepgramAmbient (streaming WS, nova-3
+  language=multi, diarize, KeepAlive timer vs 1011 idle-close, flat
+  "channel" payloads — NOT REST nesting); /ws/ambient endpoint (bearer-auth,
+  binary PCM in, ambient_segment events out, ZERO Gemini = structural
+  silence); ambient turns persisted via the Phase 2 queue+writer
+  (mode=ambient, kind=ambient turns with speaker/text/start_s/end_s);
+  GET /sessions/{id} passes ambient turns through in their own shape.
+- Tests: 122 pass (7 new: payload parse incl. majority-speaker, grouping).
+- E2E local PASS: 11 segments WS + Firestore readback mode=ambient
+  speakers=[0,1]. Prod probe PASS (rev 00043): 13 segments, speakers=[0,1]
+  over wss on run.app. Probe docs cleaned from Firestore.
+- Prod env: DEEPGRAM_KEY added to Cloud Run (rev 00043 deploy set).
+- Google STT v2 probes (25 Aug, e0bbbd2): NO diarization on any usable
+  path — Google demoted to transcription-only fallback (details above).
+- stt_smoke.py / deepgram_smoke.py / ambient_e2e.py / ambient_prod_probe.py
+  are the verification chain for any future provider swap.
+- REMAINING in C1: mobile — ambient toggle + recording-indicator consent
+  screen, far-field capture profile (MIC source, relaxed NS, no AGC),
+  ambient WS client, ambient transcripts in History UI.
+- Mobile: ambient toggle on voice screen + recording indicator + one-time consent
+  screen; dual capture profiles — near-talk (current echoCancel/NS settings,
+  unchanged) vs far-field ambient (MIC source, relaxed NS, no AGC — device has
+  none anyway); chosen by session mode.
+- Fork alternatives: (a) if streaming integration is painful → batch-chunk every
+  ~30 s through the same provider (laggier, same diarization, simpler); (b) if
+  Google streaming Marathi quality disappoints → Deepgram/Assembly batch for
+  Marathi as stopgap; (c) provider interface means vendor swap is config-only.
+- Gate: Paresh uses it at a real table; transcript readability acceptable.
+
+**C2 — Invocation gate**
+- Spot "Sirious" in the ambient transcript stream (case/punct tolerant; STT
+  keyterm/phrase boosting pinned to the word where the provider supports it) →
+  hot-start a Gemini Live session seeded with recent transcript tail → answer
+  through existing playback path → on answer end, back to ambient.
+- Fork alternatives (in order if needed): (a) on-device hotword model
+  (openWakeWord-class, ~2–5 MB, ~2–5% CPU — NOT heavy, but Flutter integration
+  work) if STT mangles the proper noun too often; (b) Silero VAD + hotword combo;
+  (c) tap-the-phone-to-invoke as the always-works fallback. Latency note:
+  detection choice moves ~300–500 ms of a ~2–4 s pipeline dominated by Gemini
+  connect — text-spotting first is the right default.
+- Gate: "Sirious, …" answered within a few seconds at a real table; silence
+  otherwise (structural, by architecture).
+
+**C2.5 — Answer-time echo handling (ducking ladder)**
+1. HARD DUCK first: suppress/discard capture while Sirious speaks + ~300 ms
+   post-playback settle (residual echo decay). Deterministic, zero deps.
+2. PARTIAL DUCK upgrade: instead of mute, attenuate mic 10–20 dB during playback;
+   existing barge-in onset detector + 200–300 ms sustained-speech debounce decides
+   real-interrupt-vs-echo. This is the ChatGPT-parity "mostly works, sometimes
+   buggy" target. (Idea from Perplexity cross-check, adopted 25 Aug.)
+3. AUTO POLICY: wired headset connected → today's full-duplex behavior; loudspeaker
+   → ducked mode. AudioManager detection, per-session, no user toggle.
+4. ESCALATION ONLY IF 2 ANNOYS: in-app software AEC — SpeexDSP (simpler) then
+   WebRTC AEC3 (better) via NDK with playback-as-reference. The labs' way; its own
+   mini-phase; not planned unless triggered. Server-side AEC parked permanently
+   (hardest variant, no Gemini reference channel).
+- Gate: no ghost turns from Sirious's own voice in ambient transcript; (after 2)
+  speaker barge-in works most of the time.
+
+**C3 — Manual name mapping**
+- Long-press a speaker label in transcript detail → assign name; updates stored
+  turns; cascades into memory provenance. No forks; trivial.
+
+**C4 — Memory integration**
+- Extraction attributes statements to speakers (fills the null `speaker` field
+  from Phase 3 — schema already supports it); recall answers "what did Peter say
+  about Mumbai?" with provenance. Fork: if per-speaker extraction quality is poor,
+  keep extraction global and store speaker tags only on turns (display-level).
+
+**C5 — Hardening & docs**
+- Noisy-room testing, battery/heat on device, cost instrumentation (ambient
+  minutes logged per session), protocol docs v3 (ambient mode + events), phase
+  gate checklist, then Phase 6 (voiceprint identity) builds on C3's mapping.
 
 ### Scope
 
 **In:**
-
-- Explicit **invocation model** (wake phrase, button, or "Sirious" address) before responding
-- Continuous listening mode with clear UX (recording indicator, consent)
-- **Speaker diarization** (Speaker 1, Speaker 2, …) via separate service — not Gemini Live alone
-- Transcripts tagged by speaker label
-- Optional manual name mapping: "Speaker 2 is Peter"
+- Explicit invocation model before responding (structural silence in ambient)
+- Continuous listening mode with clear UX (recording indicator, consent screen)
+- Speaker diarization via dedicated STT provider (not Gemini Live)
+- Transcripts tagged by speaker label; optional manual name mapping
+- Ducking ladder for answer-time echo (C2.5)
 
 **Out (still):**
-
-- Automatic voice fingerprinting
-- Face recognition
+- Automatic voice fingerprinting (Phase 6, after C3)
+- Face recognition, vision
 - Proactive unsolicited interjections
+- Full-duplex group barge-in (unless C2.5 step 4 ever triggers)
+- Always-on Gemini during ambient (rejected architecture)
 
 ### Success criteria
 
-- [ ] Assistant stays silent during ambient conversation until invoked
+- [ ] Assistant stays silent during ambient conversation until invoked (structural)
 - [ ] Transcript distinguishes multiple speakers with acceptable accuracy in quiet room
+- [ ] Works with Marathi-dominant home conversation (Paresh's real environment)
 - [ ] User can assign names to speaker labels manually
+- [ ] No ghost turns from Sirious's own speech in ambient transcripts
+- [ ] Normal 1:1 mode shows zero regression
 
 ### Risks
 
-- Noisy environments degrade diarization
-- Legal/privacy: recording group conversations — consent UX required
-- Cost of always-on streaming in group settings
+- Noisy environments degrade diarization (mitigate: real-table gates per chunk)
+- Legal/privacy: recording group conversations — consent UX in C1; provider
+  data-logging choice owned by Paresh (logging ON initially, switchable)
+- Cost of always-on streaming — bounded: <5 h/month expected ≈ $2–7/mo all-in
+- Marathi streaming quality on Google unproven until C1 smoke test
+- Far-field capture quality on E346B mics unproven until first real table test
+  (C0.5 verified effects attach; room acoustics still unknown)
 
 ---
 
@@ -792,8 +953,14 @@ Later meeting:
 
 ### Dependencies
 
-- Phase 5 diarization infrastructure
+- Phase 5 diarization infrastructure (C1 segments + C3 name mapping — the labels
+  Phase 6a replaces with enrolled identities)
 - Strong privacy/consent framework from Phase 2–3
+
+> **Note (25 Aug 2026):** vendor diarization (Google/Deepgram/Assembly) produces
+> speaker *labels*, not reusable voice embeddings — so Phase 6a still needs its own
+> embedder (enrollment + matching) regardless of which STT vendor won. The coupling
+> to Phase 5 is at the transcript-segment level, not the audio level.
 
 ---
 
@@ -843,7 +1010,8 @@ Regardless of excitement about the north star, **do not start** these until thei
 
 | Feature | Wait until |
 |---------|------------|
-| Voice fingerprinting (Peter/Jack) | Phase 6, after Phase 5 diarization |
+| Voice fingerprinting (Peter/Jack) | Phase 6, after Phase 5 diarization + C3 name mapping |
+| In-app software AEC (SpeexDSP/AEC3) | C2.5 step 4 — only if partial-duck barge-in annoys in daily use |
 | Camera / face ID | Phase 6b, after voice identity works |
 | Long-term memory | Phase 3, after Phase 2 persistence |
 | Calendar/email/tools | Phase 4, after Phase 3 memory |
