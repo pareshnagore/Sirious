@@ -790,7 +790,8 @@ Later, History shows: S1: ... / S2: ... / S1: ...   (long-press → name a speak
 - Consequence: answer-time strategy is DUCKING (no exceptions); ambient mode needs
   no echo handling at all (nothing plays).
 
-**C1 — Ambient plumbing — backend DONE 26 Aug 2026 (rev 00043, prod-verified)**
+**C1 — Ambient plumbing — COMPLETE (backend+mobile, 26 Aug 2026, rev 00045).**
+Pending: real-table human gate (Paresh expects positive). C2 starts next session.
 - Backend: SttProvider interface + DeepgramAmbient (streaming WS, nova-3
   language=multi, diarize, KeepAlive timer vs 1011 idle-close, flat
   "channel" payloads — NOT REST nesting); /ws/ambient endpoint (bearer-auth,
@@ -819,10 +820,15 @@ Later, History shows: S1: ... / S2: ... / S1: ...   (long-press → name a speak
   PASS (4 merged turns vs 13 fragments).
 - REMAINING in C1: real-table gate — 2–3 humans, office Hinglish, phone on
   table; judge History transcript readability. Then C2 invocation.
-- Mobile: ambient toggle on voice screen + recording indicator + one-time consent
-  screen; dual capture profiles — near-talk (current echoCancel/NS settings,
-  unchanged) vs far-field ambient (MIC source, relaxed NS, no AGC — device has
-  none anyway); chosen by session mode.
+- Mobile (DONE 26 Aug): AmbientSessionScreen (equalizer icon on voice screen,
+  SafeArea-fixed button), AmbientSessionController (WS client, segments,
+  error/done handling), AmbientAudioBridge (far-field CaptureProfile in
+  AudioCaptureService — NS/AGC relaxed for ambient), one-time consent screen
+  (shared_preferences) + persistent recording indicator, History detail
+  renders ambient sessions as speaker-labeled turns with "ambient" badge.
+  Voice 1:1 path byte-untouched; flutter analyze clean, widget tests pass,
+  release APK on device (build note: --no-tree-shake-icons needed on this PC
+  — Windows Application Control blocks font-subset.exe).
 - Fork alternatives: (a) if streaming integration is painful → batch-chunk every
   ~30 s through the same provider (laggier, same diarization, simpler); (b) if
   Google streaming Marathi quality disappoints → Deepgram/Assembly batch for
