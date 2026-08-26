@@ -14,6 +14,7 @@ from google import genai
 from google.genai import types
 
 from .store import get_store
+from .stt import DeepgramAmbient, DiarizedUtterance
 from .memory import get_memory_store
 from .tools import (
     build_registry,
@@ -164,14 +165,23 @@ async def get_session(
     if doc is None:
         raise HTTPException(status_code=404, detail="session not found")
     turns = doc.get("turns") or []
-    return {
-        "id": doc_id,
-        **{k: doc.get(k) for k in (
-            "client_session_id", "title", "model", "device", "started_at",
-            "ended_at", "duration_s", "end_reason", "resume_count",
-            "turn_count",
-        )},
-        "turns": [
+    # Ambient turns (Phase 5) pass through with their own shape; voice turns
+    # keep the normalized voice shape.
+    if doc.get("mode") == "ambient":
+        turns_out = [
+            {
+                "id": t.get("id"),
+                "kind": "ambient",
+                "ended_at": t.get("ended_at"),
+                "speaker": t.get("speaker"),
+                "text": t.get("text") or "",
+                "start_s": t.get("start_s"),
+                "end_s": t.get("end_s"),
+            }
+            for t in turns
+        ]
+    else:
+        turns_out = [
             {
                 "id": t.get("id"),
                 "started_at": t.get("started_at"),
@@ -182,7 +192,15 @@ async def get_session(
                 "reason": t.get("reason"),
             }
             for t in turns
-        ],
+        ]
+    return {
+        "id": doc_id,
+        **{k: doc.get(k) for k in (
+            "client_session_id", "title", "model", "device", "started_at",
+            "ended_at", "duration_s", "end_reason", "resume_count",
+            "turn_count", "mode",
+        )},
+        "turns": turns_out,
     }
 
 
@@ -382,6 +400,139 @@ async def unregister_device(
     await get_device_token_store().remove(request.token)
     log_event("fcm", "device_unregistered")
     return {"removed": True}
+
+
+@app.websocket("/ws/ambient")
+async def ambient_ws_endpoint(
+    websocket: WebSocket,
+    client_session_id: str | None = None,
+):
+    """Phase 5 C1 — AMBIENT MODE: mic audio -> Deepgram STT+diarization.
+
+    Structural silence: NO Gemini session exists here, nothing can talk.
+    Binary frames = 16 kHz PCM16 mono -> provider. JSON in = control
+    ("ping"/"stop"). JSON out = {"type":"ambient_segment", speaker, text,
+    start_s, end_s} per utterance + session_started/pong/error lifecycle.
+    Turns persist via the same queue+writer pattern as voice sessions
+    (mode="ambient", kind="ambient" turns with speaker tags).
+    """
+    if not check_ws_auth(websocket, client_session_id):
+        await websocket.close(code=4401, reason="unauthorized")
+        return
+    if os.environ.get("DEEPGRAM_KEY", "") == "":
+        await websocket.close(code=4503, reason="ambient STT not configured")
+        return
+
+    await websocket.accept()
+    session_id = str(uuid.uuid4())
+    doc_id = client_session_id or session_id
+    store = get_store()
+
+    store.start_session(
+        doc_id,
+        client_session_id=client_session_id,
+        model="deepgram-nova-3",
+        resumed=False,
+        device=websocket.headers.get("user-agent"),
+        now_iso=now(),
+        mode="ambient",
+    )
+    log_event(session_id, "ambient_session_started", client_session_id=client_session_id)
+    await websocket.send_json({
+        "type": "session_started",
+        "session_id": session_id,
+        "mode": "ambient",
+    })
+
+    loop = asyncio.get_running_loop()
+    audio_in_bytes = 0
+    provider: DeepgramAmbient | None = None
+    stop_event = asyncio.Event()
+
+    def on_segment(seg: DiarizedUtterance) -> None:
+        """Called from the provider's recv task. Never blocks: persistence
+        goes through the store queue; client push is scheduled on the loop."""
+        nonlocal audio_in_bytes  # noqa: F841 — symmetric with voice path
+        store.record_ambient_turn(
+            doc_id,
+            speaker_tag=seg.speaker_tag,
+            text=seg.text,
+            start_s=seg.start,
+            end_s=seg.end,
+            now_iso=now(),
+        )
+        log_event(
+            session_id,
+            "ambient_segment",
+            speaker=seg.speaker_tag,
+            chars=len(seg.text),
+        )
+        asyncio.run_coroutine_threadsafe(
+            _safe_send({
+                "type": "ambient_segment",
+                "speaker": seg.speaker_tag,
+                "text": seg.text,
+                "start_s": seg.start,
+                "end_s": seg.end,
+            }),
+            loop,
+        )
+
+    async def _safe_send(payload: dict) -> None:
+        with contextlib.suppress(Exception):
+            await websocket.send_json(payload)
+
+    # NOTE: DeepgramAmbient callbacks fire on the event loop (its recv task
+    # lives in the same loop), so run_coroutine_threadsafe is belt-and-braces
+    # for loop affinity — cheap and correct either way.
+
+    provider = DeepgramAmbient(on_segment)
+    try:
+        await provider.start()
+    except Exception as e:  # noqa: BLE001
+        log_event(session_id, "ambient_provider_start_error", error=repr(e))
+        await websocket.send_json({"type": "error", "message": "STT unavailable"})
+        store.end_session(
+            doc_id, now_iso=now(), reason="provider_start_failed",
+            audio_in_bytes=0, audio_out_bytes=0,
+        )
+        await websocket.close(code=1011, reason="stt unavailable")
+        return
+
+    try:
+        while True:
+            message = await websocket.receive()
+            if message["type"] == "websocket.disconnect":
+                log_event(session_id, "ambient_client_disconnected")
+                break
+            if message.get("bytes"):
+                data = message["bytes"]
+                audio_in_bytes += len(data)
+                await provider.feed(data)
+            elif message.get("text"):
+                control = message["text"]
+                if control == "stop":
+                    break
+                if control == "ping":
+                    await _safe_send({"type": "pong"})
+    except WebSocketDisconnect:
+        log_event(session_id, "ambient_client_disconnected")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        log_event(session_id, "ambient_session_error", error=repr(e))
+    finally:
+        stop_event.set()
+        if provider is not None:
+            await provider.close()
+        store.end_session(
+            doc_id,
+            now_iso=now(),
+            reason="session_ended",
+            audio_in_bytes=audio_in_bytes,
+            audio_out_bytes=0,
+        )
+        log_event(session_id, "ambient_session_ended", audio_in_bytes=audio_in_bytes)
 
 
 @app.websocket("/ws")

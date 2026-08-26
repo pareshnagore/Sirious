@@ -184,6 +184,7 @@ class SessionStore:
         resumed: bool,
         device: str | None,
         now_iso: str,
+        mode: str = "voice",
     ) -> None:
         ms = _ms()
         self._seed_start_ms(doc_id, ms)
@@ -197,6 +198,7 @@ class SessionStore:
                     "client_session_id": client_session_id,
                     "model": model,
                     "device": device,
+                    "mode": mode,
                     "started_at": now_iso,
                     "started_ms": _ms(),
                     "updated_ms": _ms(),
@@ -211,6 +213,39 @@ class SessionStore:
                     "schema_version": 1,
                 },
             },
+        )
+
+    def record_ambient_turn(
+        self,
+        doc_id: str,
+        *,
+        speaker_tag: int,
+        text: str,
+        start_s: float,
+        end_s: float,
+        now_iso: str,
+    ) -> None:
+        """Phase 5 ambient mode: one diarized utterance = one turn."""
+        turn = {
+            "id": f"amb-{_ms()}-{speaker_tag}",
+            "kind": "ambient",
+            "speaker": int(speaker_tag),
+            "text": text,
+            "start_s": round(float(start_s), 2),
+            "end_s": round(float(end_s), 2),
+            "ended_at": now_iso,
+        }
+        buf = self._buffer(doc_id)
+        if not buf.get("title") and text.strip():
+            buf["title"] = make_title(text)
+            buf["title_pending"] = True
+        extra: dict[str, Any] = {}
+        if buf.pop("title_pending", False) and buf.get("title"):
+            extra["title"] = buf["title"]
+        self._enqueue(
+            "turn",
+            doc_id,
+            {"turn": turn, "updated_ms": _ms(), "now_iso": now_iso, **extra},
         )
 
     def record_turn(self, doc_id: str, *, summary: dict[str, Any], now_iso: str) -> None:
@@ -359,6 +394,7 @@ class NullSessionStore:
 
     def start_session(self, *a: Any, **k: Any) -> None: ...
     def record_turn(self, *a: Any, **k: Any) -> None: ...
+    def record_ambient_turn(self, *a: Any, **k: Any) -> None: ...
     def end_session(self, *a: Any, **k: Any) -> None: ...
     def snapshot_turns(self, doc_id: str) -> list[dict[str, Any]]:
         return []
