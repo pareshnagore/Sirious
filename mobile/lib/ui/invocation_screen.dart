@@ -61,7 +61,11 @@ class _InvocationScreenState extends State<InvocationScreen> {
   Future<void> _start() async {
     setState(() => _status = 'Connecting Sirious…');
     try {
-      await _controller.startSession(seed: widget.seed, invoke: widget.invoke);
+      await _controller.startSession(
+        seed: widget.seed,
+        invoke: widget.invoke,
+        duckCapture: true, // table mode: don't let the speaker feed the mic
+      );
     } catch (error) {
       if (!mounted) return;
       setState(() => _status = 'Could not start: $error');
@@ -116,9 +120,11 @@ class _InvocationScreenState extends State<InvocationScreen> {
 
   void _startDrainPoll() {
     _drainPoll?.cancel();
-    // Poll the playback service: return once the queue is empty AND no feed
-    // activity for a settle window (the tail of the answer has played out).
-    const settle = Duration(milliseconds: 1200);
+    // Poll the playback service: return once the answer has fully played out.
+    // Conditions: the queue is empty AND no feed activity for a settle window
+    // AND the controller has moved past playing (turn complete → listening).
+    // Any new feed activity (e.g. a follow-up answer) re-arms the window.
+    const settle = Duration(milliseconds: 2500);
     const poll = Duration(milliseconds: 400);
     var lastGen = _controller.audioPlayback.activityGeneration;
     var lastChange = DateTime.now();
@@ -129,12 +135,15 @@ class _InvocationScreenState extends State<InvocationScreen> {
       }
       final gen = _controller.audioPlayback.activityGeneration;
       final queueEmpty = _controller.audioPlayback.queueLength == 0;
-      if (gen != lastGen) {
+      final phase = _controller.phase;
+      if (gen != lastGen ||
+          phase == SessionPhase.playing ||
+          phase == SessionPhase.responding) {
         lastGen = gen;
         lastChange = DateTime.now();
       }
       final quietFor = DateTime.now().difference(lastChange);
-      if (queueEmpty && quietFor >= settle) {
+      if (queueEmpty && quietFor >= settle && phase == SessionPhase.listening) {
         timer.cancel();
         _returnToAmbient();
       }

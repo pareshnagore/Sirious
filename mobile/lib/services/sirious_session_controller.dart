@@ -72,6 +72,13 @@ class SiriousSessionController extends ChangeNotifier {
   Timer? _reconnectTimer;
   Timer? _keepaliveTimer;
 
+  /// C2 hard duck (C2.5 step 1): while the assistant is ANSWERING an
+  /// invocation, do NOT stream mic audio to Gemini. On a table the speaker
+  /// output would otherwise be transcribed back as a (barge-in) user turn
+  /// and cut the answer off mid-sentence. Table mode has no barge-in yet —
+  /// by design (ducking ladder step 1, no exceptions).
+  bool _captureDucked = false;
+
   /// Backoff delay for the Nth retry (1s, 2s, 4s, … capped at 8s).
   Duration _reconnectDelay() {
     final exp = math.min(_reconnectAttempts, 3); // 2^3 = 8s cap
@@ -220,7 +227,11 @@ class SiriousSessionController extends ChangeNotifier {
     latency.resetForTurn();
   }
 
-  Future<void> startSession({String? seed, String? invoke}) async {
+  Future<void> startSession({
+    String? seed,
+    String? invoke,
+    bool duckCapture = false,
+  }) async {
     if (_phase.isActive) {
       return;
     }
@@ -237,6 +248,7 @@ class SiriousSessionController extends ChangeNotifier {
     latency.resetForTurn();
     _allowReconnect = true;
     _reconnectAttempts = 0;
+    _captureDucked = duckCapture;
     _setPhase(SessionPhase.connecting);
 
     try {
@@ -268,6 +280,7 @@ class SiriousSessionController extends ChangeNotifier {
 
   Future<void> _cleanupSession({required SessionPhase endPhase}) async {
     _allowReconnect = false;
+    _captureDucked = false;
     _stopKeepalive();
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
@@ -298,6 +311,18 @@ class SiriousSessionController extends ChangeNotifier {
 
   void _onMicChunk(Uint8List chunk) {
     latency.firstMicChunkAt ??= DateTime.now();
+
+    // C2 hard duck: while the assistant is answering an invocation, do NOT
+    // stream mic audio (speaker echo would be transcribed back as a user
+    // turn and cut the answer off). No barge-in in ducked mode — the user's
+    // request already rode the invoke text; follow-ups work after
+    // turn_complete (phase returns to listening and capture resumes).
+    if (_captureDucked &&
+        (_phase == SessionPhase.playing ||
+            _phase == SessionPhase.responding ||
+            _phase == SessionPhase.interrupting)) {
+      return;
+    }
 
     // Barge-in onset: track mic energy while Sirious is talking (including the
     // brief `interrupting` window so a fast server response can't suppress it).
