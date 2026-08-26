@@ -25,6 +25,16 @@ class AudioPlaybackService {
   bool _flushing = false;
   bool _draining = false;
 
+  /// Monotonic activity counter: bumped on every enqueue and every native
+  /// feed request. Lets callers detect "playback has gone quiet" without
+  /// polling internals (Phase 5 C2 auto-return after an invocation answer).
+  int _activityGeneration = 0;
+  int get activityGeneration => _activityGeneration;
+
+  /// Number of PCM chunks currently buffered, waiting to be fed to the
+  /// native player.
+  int get queueLength => _queue.length;
+
   Future<void> init() async {
     if (_initialized) {
       return;
@@ -32,9 +42,7 @@ class AudioPlaybackService {
 
     await FlutterPcmSound.setLogLevel(LogLevel.error);
     await _setupOutput();
-    await FlutterPcmSound.setFeedThreshold(
-      AppConfig.outputSampleRate ~/ 10,
-    );
+    await FlutterPcmSound.setFeedThreshold(AppConfig.outputSampleRate ~/ 10);
     FlutterPcmSound.setFeedCallback(_onFeedRequested);
 
     _initialized = true;
@@ -54,6 +62,7 @@ class AudioPlaybackService {
     }
 
     _queue.add(pcm);
+    _activityGeneration++;
     unawaited(_drain());
   }
 
@@ -86,6 +95,7 @@ class AudioPlaybackService {
       return;
     }
 
+    _activityGeneration++;
     await _drain();
   }
 
@@ -99,24 +109,22 @@ class AudioPlaybackService {
     }
 
     _flushing = true;
-        _queue.clear();
+    _queue.clear();
 
-        DateTime? stopTime;
-        try {
-          await FlutterPcmSound.release();
-          // The speaker is silent the instant the native engine is released.
-          // Timestamp it HERE — the re-setup below is extra latency, not silence.
-          stopTime = DateTime.now();
-          await _setupOutput();
-          await FlutterPcmSound.setFeedThreshold(
-            AppConfig.outputSampleRate ~/ 10,
-          );
-        } finally {
-          _flushing = false;
-        }
+    DateTime? stopTime;
+    try {
+      await FlutterPcmSound.release();
+      // The speaker is silent the instant the native engine is released.
+      // Timestamp it HERE — the re-setup below is extra latency, not silence.
+      stopTime = DateTime.now();
+      await _setupOutput();
+      await FlutterPcmSound.setFeedThreshold(AppConfig.outputSampleRate ~/ 10);
+    } finally {
+      _flushing = false;
+    }
 
-        return stopTime;
-      }
+    return stopTime;
+  }
 
   /// App-teardown only. Not called between sessions.
   Future<void> dispose() async {

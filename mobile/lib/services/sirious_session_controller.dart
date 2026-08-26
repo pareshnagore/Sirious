@@ -28,6 +28,9 @@ class SiriousSessionController extends ChangeNotifier {
   final AudioPlaybackService _audioPlayback = AudioPlaybackService();
   late final WebSocketClient _webSocketClient;
 
+  /// Exposed for the C2 invocation screen's auto-return (playback drain).
+  AudioPlaybackService get audioPlayback => _audioPlayback;
+
   SessionPhase _phase = SessionPhase.idle;
   String? _sessionId;
   String? _errorMessage;
@@ -217,7 +220,7 @@ class SiriousSessionController extends ChangeNotifier {
     latency.resetForTurn();
   }
 
-  Future<void> startSession() async {
+  Future<void> startSession({String? seed, String? invoke}) async {
     if (_phase.isActive) {
       return;
     }
@@ -238,7 +241,11 @@ class SiriousSessionController extends ChangeNotifier {
 
     try {
       await _audioPlayback.init();
-      await _webSocketClient.connect(clientSessionId: _clientSessionId);
+      await _webSocketClient.connect(
+        clientSessionId: _clientSessionId,
+        seed: seed,
+        invoke: invoke,
+      );
       await _audioCapture.start();
       _startKeepalive();
       _setPhase(SessionPhase.listening);
@@ -366,9 +373,9 @@ class SiriousSessionController extends ChangeNotifier {
           _pushBargeInLine(
             resumed
                 ? 'Reconnected — Gemini context RESUMED '
-                    '(after $recovered retr${recovered == 1 ? 'y' : 'ies'})'
+                      '(after $recovered retr${recovered == 1 ? 'y' : 'ies'})'
                 : 'Reconnected after $recovered retr'
-                    '${recovered == 1 ? 'y' : 'ies'} (fresh Gemini context)',
+                      '${recovered == 1 ? 'y' : 'ies'} (fresh Gemini context)',
           );
           unawaited(
             _logToFile(
@@ -378,9 +385,7 @@ class SiriousSessionController extends ChangeNotifier {
           );
           _setPhase(SessionPhase.listening);
         } else {
-          unawaited(
-            _logToFile('SESSION started=$_sessionId resumed=$resumed'),
-          );
+          unawaited(_logToFile('SESSION started=$_sessionId resumed=$resumed'));
         }
         break;
 

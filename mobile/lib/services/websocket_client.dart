@@ -38,16 +38,29 @@ class WebSocketClient {
 
   bool get isConnected => _channel != null;
 
-  Future<void> connect({String? clientSessionId}) async {
+  Future<void> connect({
+    String? clientSessionId,
+    String? seed,
+    String? invoke,
+  }) async {
     await disconnect();
 
     // Append the stable client_session_id so the backend can resume the same
     // Gemini session across reconnects (protocol v2). Absent → fresh session.
+    // Phase 5 C2: `seed` = recent ambient room tail, `invoke` = the trigger
+    // utterance ("Sirious, can you answer that?") → the backend seeds the
+    // system instruction and answers WITHOUT the user repeating to the mic.
     var target = Uri.parse(_wsUrl);
     final query = <String, String>{...target.queryParameters};
 
     if (clientSessionId != null && clientSessionId.isNotEmpty) {
       query['client_session_id'] = clientSessionId;
+    }
+    if (seed != null && seed.isNotEmpty) {
+      query['seed'] = seed;
+    }
+    if (invoke != null && invoke.isNotEmpty) {
+      query['invoke'] = invoke;
     }
 
     // Phase 2 auth: server rejects the handshake without ?token=...

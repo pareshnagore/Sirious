@@ -23,14 +23,20 @@ class AmbientSegment {
   final double endS;
 
   factory AmbientSegment.fromJson(Map<String, dynamic> j) => AmbientSegment(
-        speaker: (j['speaker'] as num?)?.toInt() ?? 0,
-        text: j['text'] as String? ?? '',
-        startS: (j['start_s'] as num?)?.toDouble() ?? 0,
-        endS: (j['end_s'] as num?)?.toDouble() ?? 0,
-      );
+    speaker: (j['speaker'] as num?)?.toInt() ?? 0,
+    text: j['text'] as String? ?? '',
+    startS: (j['start_s'] as num?)?.toDouble() ?? 0,
+    endS: (j['end_s'] as num?)?.toDouble() ?? 0,
+  );
 }
 
 enum AmbientPhase { idle, connecting, listening, error }
+
+/// Phase 5 C2: fired when an ambient segment contains the invocation word.
+/// `trigger` is the segment that matched; `tail` is the recent segments that
+/// precede it (the room context to seed Gemini with).
+typedef AmbientInvocationHandler =
+    void Function(AmbientSegment trigger, List<AmbientSegment> tail);
 
 /// Phase 5 C1: live ambient session — mic → /ws/ambient → diarized segments.
 ///
@@ -48,10 +54,18 @@ class AmbientSessionController extends ChangeNotifier {
   String? _clientSessionId;
   bool _stopping = false;
 
+  /// C2 invocation callback — set by the ambient screen/bridge. Fires once
+  /// per segment that matches [isInvocationText].
+  AmbientInvocationHandler? onInvocation;
+
+  /// Room segments kept for the C2 seed tail (bounded; oldest dropped).
+  static const int invocationTailSegments = 8;
+
   AmbientPhase get phase => _phase;
   String? get errorMessage => _errorMessage;
   List<AmbientSegment> get segments => List.unmodifiable(_segments);
-  bool get isActive => _phase == AmbientPhase.connecting || _phase == AmbientPhase.listening;
+  bool get isActive =>
+      _phase == AmbientPhase.connecting || _phase == AmbientPhase.listening;
 
   Future<void> start() async {
     if (isActive) return;
@@ -74,10 +88,7 @@ class AmbientSessionController extends ChangeNotifier {
     final base = Uri.parse(AppConfig.wsUrl);
     final wsUri = base.replace(
       path: '/ws/ambient',
-      queryParameters: {
-        'token': token,
-        'client_session_id': _clientSessionId!,
-      },
+      queryParameters: {'token': token, 'client_session_id': _clientSessionId!},
     );
 
     try {
@@ -120,7 +131,9 @@ class AmbientSessionController extends ChangeNotifier {
       final decoded = jsonDecode(message);
       if (decoded is! Map<String, dynamic>) return;
       if (decoded['type'] == 'ambient_segment') {
-        _segments.add(AmbientSegment.fromJson(decoded));
+        final segment = AmbientSegment.fromJson(decoded);
+        _segments.add(segment);
+        _maybeDetectInvocation(segment);
         notifyListeners();
       } else if (decoded['type'] == 'error') {
         _errorMessage = decoded['message'] as String? ?? 'server error';
@@ -129,6 +142,40 @@ class AmbientSessionController extends ChangeNotifier {
     } on FormatException {
       // ignore non-JSON frames
     }
+  }
+
+  /// C2: spot the invocation word in a fresh segment. Case/punct tolerant;
+  /// deliberately does NOT match the common word "serious" (s-e-r-i-o-u-s —
+  /// a different vowel) so office Hinglish ("main serious hoon") can't false
+  /// trigger. STT is primed to emit "Sirious" via Deepgram keyword boost.
+  @visibleForTesting
+  static bool isInvocationText(String text) {
+    final norm = text.toLowerCase().replaceAll(
+      RegExp(r'[^\p{L}\p{N} ]', unicode: true),
+      ' ',
+    );
+    return RegExp(r'\bs(?:irious|iryus|irius)\b').hasMatch(norm);
+  }
+
+  void _maybeDetectInvocation(AmbientSegment segment) {
+    if (onInvocation == null || !isInvocationText(segment.text)) return;
+    final tail = invocationTail(_segments, segment, invocationTailSegments);
+    onInvocation!(segment, tail);
+  }
+
+  /// The room context to seed Gemini with: recent segments EXCLUDING the
+  /// trigger (which becomes the invoke text itself). Most recent kept first,
+  /// bounded to [maxSegments].
+  @visibleForTesting
+  static List<AmbientSegment> invocationTail(
+    List<AmbientSegment> all,
+    AmbientSegment trigger,
+    int maxSegments,
+  ) {
+    final start = all.length > maxSegments ? all.length - maxSegments : 0;
+    final tail = all.sublist(start);
+    tail.removeWhere((s) => identical(s, trigger));
+    return tail;
   }
 
   void _onDone() {
