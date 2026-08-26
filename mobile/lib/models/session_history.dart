@@ -44,6 +44,11 @@ class HistoryTurn {
     this.startedAt,
     this.endedAt,
     this.reason,
+    this.isAmbient = false,
+    this.speaker,
+    this.ambientText = '',
+    this.startS,
+    this.endS,
   });
 
   final String id;
@@ -54,15 +59,30 @@ class HistoryTurn {
   final String? endedAt;
   final String? reason;
 
-  factory HistoryTurn.fromJson(Map<String, dynamic> j) => HistoryTurn(
-        id: j['id'] as String? ?? '',
-        userText: j['user_text'] as String? ?? '',
-        assistantText: j['assistant_text'] as String? ?? '',
-        interrupted: j['interrupted'] as bool? ?? false,
-        startedAt: j['started_at'] as String?,
-        endedAt: j['ended_at'] as String?,
-        reason: j['reason'] as String?,
-      );
+  // Ambient (Phase 5) shape — set when isAmbient is true.
+  final bool isAmbient;
+  final int? speaker;
+  final String ambientText;
+  final double? startS;
+  final double? endS;
+
+  factory HistoryTurn.fromJson(Map<String, dynamic> j) {
+    final isAmbient = j['kind'] == 'ambient';
+    return HistoryTurn(
+      id: j['id'] as String? ?? '',
+      userText: j['user_text'] as String? ?? '',
+      assistantText: j['assistant_text'] as String? ?? '',
+      interrupted: j['interrupted'] as bool? ?? false,
+      startedAt: j['started_at'] as String?,
+      endedAt: j['ended_at'] as String?,
+      reason: j['reason'] as String?,
+      isAmbient: isAmbient,
+      speaker: (j['speaker'] as num?)?.toInt(),
+      ambientText: j['text'] as String? ?? '',
+      startS: (j['start_s'] as num?)?.toDouble(),
+      endS: (j['end_s'] as num?)?.toDouble(),
+    );
+  }
 }
 
 class SessionDetail {
@@ -76,6 +96,7 @@ class SessionDetail {
     this.durationS,
     this.endReason,
     this.resumeCount = 0,
+    this.mode = 'voice',
     this.turns = const [],
   });
 
@@ -88,7 +109,10 @@ class SessionDetail {
   final double? durationS;
   final String? endReason;
   final int resumeCount;
+  final String mode; // 'voice' | 'ambient'
   final List<HistoryTurn> turns;
+
+  bool get isAmbient => mode == 'ambient';
 
   factory SessionDetail.fromJson(Map<String, dynamic> j) => SessionDetail(
         id: j['id'] as String,
@@ -100,6 +124,7 @@ class SessionDetail {
         durationS: (j['duration_s'] as num?)?.toDouble(),
         endReason: j['end_reason'] as String?,
         resumeCount: j['resume_count'] as int? ?? 0,
+        mode: j['mode'] as String? ?? 'voice',
         turns: ((j['turns'] as List?) ?? const [])
             .map((t) => HistoryTurn.fromJson(t as Map<String, dynamic>))
             .toList(),

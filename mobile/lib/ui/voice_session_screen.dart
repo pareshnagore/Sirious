@@ -4,6 +4,7 @@ import '../config/app_config.dart';
 import '../models/session_phase.dart';
 import '../services/sirious_session_controller.dart';
 import 'history_screen.dart';
+import 'ambient_session_screen.dart';
 import 'memories_screen.dart';
 import 'widgets/status_indicator.dart';
 import 'widgets/transcript_panel.dart';
@@ -63,6 +64,21 @@ class _VoiceSessionScreenState extends State<VoiceSessionScreen> {
                     context,
                     MaterialPageRoute<void>(
                       builder: (_) => const MemoriesScreen(),
+                    ),
+                  )
+                : null,
+          ),
+          IconButton(
+            icon: const Icon(Icons.graphic_eq),
+            tooltip: 'Ambient mode (listen to the room)',
+            onPressed:
+                _controller.phase == SessionPhase.idle ||
+                    _controller.phase == SessionPhase.error
+                ? () => Navigator.push(
+                    context,
+                    MaterialPageRoute<void>(
+                      builder: (_) =>
+                          AmbientSessionScreen(voiceController: _controller),
                     ),
                   )
                 : null,

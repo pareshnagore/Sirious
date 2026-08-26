@@ -114,7 +114,10 @@ class DeepgramAmbient:
             "encoding": "linear16",
             "sample_rate": "16000",
             "channels": "1",
-            "interim_results": "true",
+            # Finals only: interims produced duplicate/partial turns in the
+            # first on-device test (26 Aug). Endpointing still yields one
+            # final per utterance, which is exactly our turn granularity.
+            "interim_results": "false",
         }
         qs = "&".join(f"{k}={v}" for k, v in params.items())
         url = f"wss://api.deepgram.com/v1/listen?{qs}"

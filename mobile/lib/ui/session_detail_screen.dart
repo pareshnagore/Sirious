@@ -55,6 +55,7 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
                 child: Text(
                   [
                     if (s.title != null) s.title!,
+                    if (s.isAmbient) 'ambient',
                     '${s.turns.length} turns',
                     if (s.durationS != null)
                       '${s.durationS!.toStringAsFixed(0)}s',
@@ -73,6 +74,31 @@ class _SessionDetailScreenState extends State<SessionDetailScreen> {
                   itemCount: s.turns.length,
                   itemBuilder: (context, i) {
                     final t = s.turns[i];
+                    // Ambient sessions render diarized turns; voice sessions
+                    // keep the You/Sirious pair layout.
+                    if (s.isAmbient || t.isAmbient) {
+                      return Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              'S${t.speaker ?? '?'}',
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .labelSmall
+                                  ?.copyWith(
+                                    color: Theme.of(context)
+                                        .colorScheme
+                                        .primary,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                            ),
+                            Text(t.ambientText),
+                          ],
+                        ),
+                      );
+                    }
                     return Padding(
                       padding: const EdgeInsets.only(bottom: 14),
                       child: Column(
