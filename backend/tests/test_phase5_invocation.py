@@ -52,10 +52,10 @@ def test_ambient_seed_block_escapes_em_dash_only():
 # ── Deepgram keyword boost (C2 spotter recall) ───────────────────────────
 
 def test_deepgram_params_keyword_default():
-    # Default env: keyword boost pins the product name on the wire.
+    # Default env: keyterm boost pins the product name on the wire.
     provider = DeepgramAmbient(on_segment=lambda seg: None)
     params = provider._params()
-    assert params["keywords"] == "Sirious"
+    assert params["keyterm"] == "Sirious"
     # Baseline streaming contract stays intact.
     assert params["interim_results"] == "false"
     assert params["encoding"] == "linear16"
@@ -66,10 +66,10 @@ def test_deepgram_params_keyword_default():
 def test_deepgram_params_keyword_env_override(monkeypatch):
     monkeypatch.setenv("SIRIOUS_STT_KEYWORD", "Sirious:5")
     provider = DeepgramAmbient(on_segment=lambda seg: None)
-    assert provider._params()["keywords"] == "Sirious:5"
+    assert provider._params()["keyterm"] == "Sirious:5"
 
 
 def test_deepgram_params_keyword_empty_env_disables(monkeypatch):
     monkeypatch.setenv("SIRIOUS_STT_KEYWORD", "   ")
     provider = DeepgramAmbient(on_segment=lambda seg: None)
-    assert "keywords" not in provider._params()
+    assert "keyterm" not in provider._params()

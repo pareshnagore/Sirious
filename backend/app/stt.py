@@ -155,9 +155,12 @@ class DeepgramAmbient:
         # C2 invocation: pin the product name in the transcript so the
         # on-device spotter sees "Sirious" instead of a phonetic lookalike
         # ("serious" is a false-positive minefield in office Hinglish).
+        # NOTE: nova-3 rejects `keywords` (400 "Keywords are not supported
+        # for Nova-3. Please use `keyterm` instead") — keyterm is the
+        # nova-class smart keyterm/prompt boosting param (verified live).
         keyword = os.environ.get("SIRIOUS_STT_KEYWORD", "Sirious").strip()
         if keyword:
-            params["keywords"] = keyword
+            params["keyterm"] = keyword
         return params
 
     async def _keepalive_loop(self) -> None:
