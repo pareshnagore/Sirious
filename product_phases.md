@@ -807,9 +807,18 @@ Later, History shows: S1: ... / S2: ... / S1: ...   (long-press → name a speak
   path — Google demoted to transcription-only fallback (details above).
 - stt_smoke.py / deepgram_smoke.py / ambient_e2e.py / ambient_prod_probe.py
   are the verification chain for any future provider swap.
-- REMAINING in C1: mobile — ambient toggle + recording-indicator consent
-  screen, far-field capture profile (MIC source, relaxed NS, no AGC),
-  ambient WS client, ambient transcripts in History UI.
+- ON-DEVICE tests (26 Aug): (1) solo voice test — chain works, but exposed
+  interim duplicates (fixed: finals-only) and single-speaker S0/S1 split
+  (relative tags on short utterances — accepted for C1, C3 name-mapping
+  absorbs); (2) Perplexity-voice-mode round (53 turns, 2.5 min) — human
+  vs machine-speaker diarization clean, Hinglish+Hindi Devanagari clean,
+  structural silence held next to a talking loudspeaker. Exposed turn
+  fragmentation (TTS micro-pauses → 4 turns/sentence) → fixed with
+  server-side turn builder (rev 00045): merge same-speaker segments within
+  2 s gap, flush on speaker change / 2.5 s idle / session end; prod probe
+  PASS (4 merged turns vs 13 fragments).
+- REMAINING in C1: real-table gate — 2–3 humans, office Hinglish, phone on
+  table; judge History transcript readability. Then C2 invocation.
 - Mobile: ambient toggle on voice screen + recording indicator + one-time consent
   screen; dual capture profiles — near-talk (current echoCancel/NS settings,
   unchanged) vs far-field ambient (MIC source, relaxed NS, no AGC — device has
