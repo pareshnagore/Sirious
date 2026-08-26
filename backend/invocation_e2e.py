@@ -19,7 +19,7 @@ import sys
 
 import websockets
 
-WS_URL = "ws://127.0.0.1:8000/ws"
+WS_URL = os.environ.get("SIRIOUS_WS_URL", "ws://127.0.0.1:8000/ws")
 
 SEED = (
     "S1: What is the longest train in the world?\n"
