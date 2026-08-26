@@ -586,7 +586,10 @@ class NullMemoryStore:
     def enabled(self) -> bool:
         return False
 
-    def request_extraction(self, doc_id: str) -> None: ...
+    def request_extraction(self, doc_id: str, turns: list[dict[str, Any]] | None = None) -> None:
+        """Null store: extraction requests are dropped (matches the real
+        signature so local dev doesn't raise TypeError in teardown)."""
+        del turns  # unused
 
     async def recall(self, query: str, top_k: int = 8) -> list[dict[str, Any]]:
         return []

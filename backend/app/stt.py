@@ -105,21 +105,7 @@ class DeepgramAmbient:
             raise RuntimeError("DEEPGRAM_KEY not configured")
         import websockets
 
-        params = {
-            "model": self.model,
-            "language": self.language,
-            "diarize": "true",
-            "punctuate": "true",
-            "smart_format": "true",
-            "encoding": "linear16",
-            "sample_rate": "16000",
-            "channels": "1",
-            # Finals only: interims produced duplicate/partial turns in the
-            # first on-device test (26 Aug). Endpointing still yields one
-            # final per utterance, which is exactly our turn granularity.
-            "interim_results": "false",
-        }
-        qs = "&".join(f"{k}={v}" for k, v in params.items())
+        qs = "&".join(f"{k}={v}" for k, v in self._params().items())
         url = f"wss://api.deepgram.com/v1/listen?{qs}"
         self._ws = await websockets.connect(
             url,
@@ -147,6 +133,32 @@ class DeepgramAmbient:
         self._ws = None
 
     # ── internals ────────────────────────────────────────────────────────
+
+    def _params(self) -> dict[str, str]:
+        """Streaming query params. Extracted from start() so tests can assert
+        the wire contract (keyword boost, finals-only, raw-PCM) without
+        opening a network socket."""
+        params = {
+            "model": self.model,
+            "language": self.language,
+            "diarize": "true",
+            "punctuate": "true",
+            "smart_format": "true",
+            "encoding": "linear16",
+            "sample_rate": "16000",
+            "channels": "1",
+            # Finals only: interims produced duplicate/partial turns in the
+            # first on-device test (26 Aug). Endpointing still yields one
+            # final per utterance, which is exactly our turn granularity.
+            "interim_results": "false",
+        }
+        # C2 invocation: pin the product name in the transcript so the
+        # on-device spotter sees "Sirious" instead of a phonetic lookalike
+        # ("serious" is a false-positive minefield in office Hinglish).
+        keyword = os.environ.get("SIRIOUS_STT_KEYWORD", "Sirious").strip()
+        if keyword:
+            params["keywords"] = keyword
+        return params
 
     async def _keepalive_loop(self) -> None:
         """Deepgram 1011-closes silent connections; KeepAlive JSON prevents it

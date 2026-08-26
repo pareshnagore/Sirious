@@ -1,6 +1,7 @@
 import os
 import asyncio
 import contextlib
+import traceback
 import json
 import time
 import uuid
@@ -580,6 +581,30 @@ async def ambient_ws_endpoint(
         log_event(session_id, "ambient_session_ended", audio_in_bytes=audio_in_bytes)
 
 
+def _clean_query_text(raw: str | None, cap: int) -> str:
+    """Trim + cap a handshake query param. Blank/whitespace -> empty."""
+    if not raw:
+        return ""
+    return raw.strip()[:cap]
+
+
+def _ambient_seed_block(seed: str) -> str:
+    """System-instruction block for the C2 ambient room-context seed.
+
+    Empty seed -> empty string (no block). The seed arrives from the phone
+    as diarized lines ("S1: …\\nS2: …") — we treat it as live room context
+    the model may REFER to but must not repeat back.
+    """
+    if not seed.strip():
+        return ""
+    return (
+        "\n\nA room conversation was just transcribed around the user "
+        "(speakers S1, S2, …; most recent last). Treat this as live context "
+        "for the user's imminent request. You may refer to it, but do not "
+        "repeat it back:\n\n" + seed.strip()
+    )
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(
     websocket: WebSocket,
@@ -594,6 +619,24 @@ async def websocket_endpoint(
     await websocket.accept()
 
     session_id = str(uuid.uuid4())
+
+    # ── C2 invocation handshake (Phase 5) ──────────────────────────────────
+    # Ambient mode ends on-device when "Sirious" is spotted in the room
+    # transcript; the phone then opens a voice session with:
+    #   seed  = recent diarized room tail ("S1: …/S2: …", capped) → appended
+    #           to the system instruction as live room context;
+    #   invoke = the trigger utterance ("Sirious, can you answer that?") →
+    #           injected to Gemini Live as a text user turn right after
+    #           connect, so it answers OUT LOUD without the user repeating
+    #           anything to the mic.
+    seed = _clean_query_text(websocket.query_params.get("seed"), 4000)
+    invoke = _clean_query_text(websocket.query_params.get("invoke"), 500)
+    ambient_block = _ambient_seed_block(seed)
+    if invoke:
+        log_event(session_id, "invoke_param", chars=len(invoke))
+    if ambient_block:
+        log_event(session_id, "ambient_seed_param", chars=len(seed))
+
 
     # ── Session resumption ──────────────────────────────────────────────────
     # A client that wants continuity across reconnects sends a stable
@@ -660,6 +703,10 @@ async def websocket_endpoint(
     # declared by app/tools.py per connection and executed through ONE
     # dispatcher in the receive loop below, with an audit record per call.
     # Best-effort: a registry problem must never delay or break the voice path.
+    # agentic recall AND Phase 4's actions (web_search, add_note) — is
+    # declared by app/tools.py per connection and executed through ONE
+    # dispatcher in the receive loop below, with an audit record per call.
+    # Best-effort: a registry problem must never delay or break the voice path.
     try:
         registry, audit_log = build_registry(
             session_id=session_id,
@@ -667,6 +714,7 @@ async def websocket_endpoint(
             memory=memory,
         )
         tool_declarations = registry.genai_tools()
+        tools_hint = ""  # init BEFORE the if — an empty registry must not unbound it
         if tool_declarations:
             # Tool-usage hints: native-audio models trigger declared functions
             # far more reliably when the system instruction tells them WHEN
@@ -860,13 +908,14 @@ async def websocket_endpoint(
                 # steers the response to always be English regardless of what
                 # language the input is transcribed/interpreted as.
                 system_instruction=(
-                    "You are Sirious, a helpful and concise voice assistant. "
-                    "ALWAYS respond in English, no matter what language the "
-                    "user speaks or is detected as speaking."
-                    + tools_hint
-                    + replay_block
-                    + memory_block
-                ),
+                                    "You are Sirious, a helpful and concise voice assistant. "
+                                    "ALWAYS respond in English, no matter what language the "
+                                    "user speaks or is detected as speaking."
+                                    + tools_hint
+                                    + replay_block
+                                    + ambient_block
+                                    + memory_block
+                                ),
 
                 input_audio_transcription=(
                     types.AudioTranscriptionConfig()
@@ -883,6 +932,21 @@ async def websocket_endpoint(
                 "session_id": session_id,
                 "resumed": resumed,
             })
+
+            # C2 invocation: the room transcript already contains the user's
+            # request ("Sirious, can you answer that?") — inject it as a text
+            # user turn so Gemini answers immediately without the user
+            # repeating anything into the mic. Best-effort: if injection
+            # fails, the phone stays on the normal voice path.
+            if invoke:
+                try:
+                    await session.send_client_content(
+                        turns={"role": "user", "parts": [{"text": invoke}]},
+                        turn_complete=True,
+                    )
+                    log_event(session_id, "invoke_injected", chars=len(invoke))
+                except Exception as e:  # noqa: BLE001
+                    log_event(session_id, "invoke_inject_error", error=repr(e))
 
             async def client_to_gemini():
                 nonlocal audio_in_bytes
@@ -1359,12 +1423,13 @@ async def websocket_endpoint(
 
     except Exception as e:
 
+        
         log_event(
             session_id,
             "session_error",
             error=repr(e),
+            traceback=_tb.format_exc()[-1800:],
         )
-
     finally:
 
         # If the client/session disappears before Gemini
