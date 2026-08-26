@@ -77,10 +77,11 @@ Product phases span multiple layers. A single product phase may complete parts o
 ```
 
 **Active focus:** **Phase 5 IN PROGRESS (started 25 Aug 2026)** — ambient & multi-speaker
-mode. Architecture agreed: side-STT ambient (NOT always-on Gemini), ducking for answer
-time, Google STT v2 (Marathi-capable streaming) as launch provider behind a provider
-interface. Working plan + fork alternatives in the Phase 5 section below; echo/barge-in
-research in `docs/echo_bargein_research.md`.
+mode. C0.5+C1+C2 DONE and on-device verified (echo solved via hard duck). NEXT:
+probe gemini-3.5-transcribe-live (open diarization question) → then C+B UX
+unification (inline answers, unified conversation context/history). Working plan +
+fork alternatives in the Phase 5 section below; echo/barge-in research in
+`docs/echo_bargein_research.md`.
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -835,11 +836,30 @@ Pending: real-table human gate (Paresh expects positive). C2 starts next session
   Marathi as stopgap; (c) provider interface means vendor swap is config-only.
 - Gate: Paresh uses it at a real table; transcript readability acceptable.
 
-**C2 — Invocation gate**
+**C2 — Invocation gate — IMPLEMENTED 26 Aug 2026 (backend+mobile+deploy), core PASS on device**
 - Spot "Sirious" in the ambient transcript stream (case/punct tolerant; STT
   keyterm/phrase boosting pinned to the word where the provider supports it) →
   hot-start a Gemini Live session seeded with recent transcript tail → answer
   through existing playback path → on answer end, back to ambient.
+- Backend: `/ws` handshake now accepts `seed` (ambient room tail, capped 4KB →
+  appended to system instruction as room context) + `invoke` (trigger text,
+  capped 500 → injected to Gemini Live as a text user turn after connect →
+  answers WITHOUT the user repeating into the mic). Deepgram keyterm boost
+  pins "Sirious" (env SIRIOUS_STT_KEYWORD; **nova-3 wants `keyterm`, NOT
+  `keywords`** — 400 caught live; fixed rev 00047). Fixed pre-existing
+  empty-registry unbound `tools_hint` (killed local dev, latent in prod);
+  NullMemoryStore signature match. E2E PASS local + prod (seed-aware answer).
+- Mobile: spotter (Sirious/siryus/sirius — deliberately NOT the everyday word
+  "serious"), seed+invoke plumbing, InvocationScreen, auto-return to ambient
+  via playback drain (queue empty + settle + phase listening), invoked banner.
+- **ECHO SOLVED (on-device, hard duck = C2.5 step 1):** invoked answer was
+  being cut off mid-sentence ("was a BHP") because the mic kept streaming to
+  Gemini during playback → own voice transcribed back as barge-in → flush().
+  Fix: `duckCapture` — while playing/responding in an invocation, mic chunks
+  are NOT sent to Gemini (request already rode invoke text; mic resumes after
+  turn_complete). User-verified working: Ambient → invoke → full answer →
+  auto-return to ambient.
+- ✚ deployed prod rev 00047 (46: initial C2, 47: keyterm fix).
 - Fork alternatives (in order if needed): (a) on-device hotword model
   (openWakeWord-class, ~2–5 MB, ~2–5% CPU — NOT heavy, but Flutter integration
   work) if STT mangles the proper noun too often; (b) Silero VAD + hotword combo;
@@ -847,7 +867,52 @@ Pending: real-table human gate (Paresh expects positive). C2 starts next session
   detection choice moves ~300–500 ms of a ~2–4 s pipeline dominated by Gemini
   connect — text-spotting first is the right default.
 - Gate: "Sirious, …" answered within a few seconds at a real table; silence
-  otherwise (structural, by architecture).
+  otherwise (structural, by architecture). ✅ met (echo solved).
+
+**C2-only PASS, but UX gaps identified by Paresh (26 Aug — the C2 UX review):**
+1. **Ambient STT quality/latency worse than main screen.** Deepgram nova-3
+   `language=multi` trades accuracy for code-switch; far-field table audio is
+   harder than close-mic; we run `interim_results=false` (finals-only) so 2
+   sentences back-to-back = ONE final emitted at the END → perceived
+   "first sentence missed" + high latency + no liveness. Far-field profile
+   also relaxed NS/AGC (device has no AGC anyway → possibly under-boosted).
+2. **History fragmentation + "(no speech captured)" + no follow-up context.**
+   Voice leg uses a FRESH client_session_id per invocation → new Firestore doc;
+   turns have user_text="" (request rode invoke text) → title falls back to
+   "(no speech captured)". Ambient doc (amb-*) and voice docs (cs-*) are
+   separate worlds; backend replay only injects user_text/assistant_text turns,
+   so ambient turns never carry forward → each invocation forgets the last.
+   Returning to ambient clears the visible segment list (clean slate by design).
+3. **Screen-swap UX** (push/pop Ambient ↔ Invocation) is not fluent.
+
+**OPEN QUESTION (26 Aug): gemini-3.5-transcribe-live — EXISTS, NEVER PROBED.**
+- Live account check: `models/gemini-3.5-transcribe` (generateContent) and
+  `models/gemini-3.5-transcribe-live` (bidiGenerateContent) are BOTH available.
+- Honest gap: our "Gemini can't diarize" conclusion (25 Aug probes) covered
+  Gemini Live (assistant) + STT v2 + chirp_3 — NOT this dedicated transcription
+  model. The old conclusion does NOT automatically apply to it.
+- Decision checklist if we probe it (dedicated probe script, ~30 min, same
+  pattern as stt_probe*.py — stream a 2-speaker Hinglish clip, inspect stream
+  for speaker labels): (1) **speaker diarization in the live stream = make or
+  break** (if absent, dead for ambient); (2) en-IN + hi-IN streaming quality +
+  code-switch vs nova-3 multi; (3) per-utterance finals latency vs our
+  finals-only Deepgram; (4) cost per ambient-hour. If it passes → unseats
+  Deepgram as launch provider (same vendor as voice model, better Hinglish
+  likely). NEXT SESSION: run this probe (discussion closed; no product-code
+  change until probe results).
+
+**PLANNED NEXT after probe — C+B UX unification (discussed 26 Aug, pending):**
+- **C (UX):** kill the screen swap — stay on ambient screen, render the answer
+  as an inline assistant bubble (room transcript scrolling under it), duck mic,
+  auto-continue listening after. One screen, one session, one History entry.
+- **B (context/history):** reuse the ambient client_session_id for the voice
+  leg; backend replay injects ambient turns as room context ("S1: …", "S2: …")
+  into the system instruction; title falls back to first ambient turn. Result:
+  one History entry per table session (room transcript + all answers), follow-up
+  invocations seeded with the full conversation, no "(no speech captured)".
+- Separate quick wins: stream interims as live hints (fix latency/first-sentence
+  feel without C1 duplicates — interims never persisted); single-language en-IN
+  experiment; AssemblyAI bake-off if Gemini probe fails diarization.
 
 **C2.5 — Answer-time echo handling (ducking ladder)**
 1. HARD DUCK first: suppress/discard capture while Sirious speaks + ~300 ms
