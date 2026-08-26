@@ -105,35 +105,46 @@ def get_provider() -> SttProvider:
 def transcribe_file_with_diarization(
     wav_path: str,
     langs: Optional[list[str]] = None,
-    model_candidates: Optional[list[str]] = None,
+    model_candidates: Optional[list[tuple[str, str]]] = None,
     project_id: str = "sirious-2026",
 ) -> tuple[str, list[DiarizedUtterance]]:
     """Batch-transcribe a 16k mono WAV with speaker diarization.
 
-    Tries model_candidates in order (Chirp 3 first, latest_long fallback) and
-    returns (model_used, utterances). Raises the last error if all fail.
+    model_candidates: ordered (model, location) pairs — chirp_3 lives in
+    `global` (verified by API 400 on 25 Aug), regional models in `us` etc.
+    Returns (model_used, utterances). Raises the last error if all fail.
     """
     from google.cloud import speech_v2 as speech
 
     langs = langs or _langs_from_env()
-    model_candidates = model_candidates or ["chirp_3", "latest_long"]
+    candidates = model_candidates or [("chirp_3", "global"), ("chirp_2", "us"), ("latest_long", "us")]
 
     with open(wav_path, "rb") as f:
         content = f.read()
 
-    client = speech.SpeechClient()
-    recognizer = f"projects/{project_id}/locations/{self_location()}/recognizers/_"
     last_err: Exception | None = None
-
-    for model in model_candidates:
+    for model, location in candidates:
+        endpoint = (
+            "speech.googleapis.com"
+            if location == "global"
+            else f"{location}-speech.googleapis.com"
+        )
+        client = speech.SpeechClient(
+            client_options={"api_endpoint": endpoint}
+        )
+        recognizer = f"projects/{project_id}/locations/{location}/recognizers/_"
         try:
             cfg = speech.RecognitionConfig(
                 language_codes=langs,
                 model=model,
-                features=speech.SpeakerDiarizationConfig(
-                    enable_speaker_diarization=True,
-                    min_speaker_count=_min_speakers(),
-                    max_speaker_count=_max_speakers(),
+                features=speech.RecognitionFeatures(
+                    # v2 (client 2.40): field is diarization_config; presence
+                    # of the config turns diarization ON.
+                    diarization_config=speech.SpeakerDiarizationConfig(
+                        min_speaker_count=_min_speakers(),
+                        max_speaker_count=_max_speakers(),
+                    ),
+                    enable_automatic_punctuation=True,
                 ),
             )
             req = speech.RecognizeRequest(
