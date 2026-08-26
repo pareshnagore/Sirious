@@ -53,7 +53,11 @@ async def main() -> None:
         await sender
 
     print(f"\nPROD RESULT: {len(segments)} segments, speakers={sorted(speakers)}")
-    assert len(segments) >= 6 and len(speakers) >= 2, "prod probe failed"
+    # Turn-builder merged the fragmented segments into readable turns
+    # (4 turns here vs 13 pre-merge) — assert quality, not count.
+    assert len(segments) >= 3 and len(speakers) >= 2, "prod probe failed"
+    merged = [s for s in segments if len(s["text"]) > 40]
+    assert merged, "expected at least one merged multi-sentence turn"
 
 
 if __name__ == "__main__":

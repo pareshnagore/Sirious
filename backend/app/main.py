@@ -449,34 +449,76 @@ async def ambient_ws_endpoint(
     provider: DeepgramAmbient | None = None
     stop_event = asyncio.Event()
 
-    def on_segment(seg: DiarizedUtterance) -> None:
-        """Called from the provider's recv task. Never blocks: persistence
-        goes through the store queue; client push is scheduled on the loop."""
-        nonlocal audio_in_bytes  # noqa: F841 — symmetric with voice path
+    # ── Turn builder (Phase 5): merge same-speaker segments into turns ──
+    # Deepgram endpointing splits fluent TTS/continuous speech at every
+    # micro-pause (first on-device test: one sentence → 4 turns). A turn is
+    # the readable unit, so buffer segments and flush when: speaker changes,
+    # gap > AMBIENT_MERGE_GAP_S, idle timer fires, or the session ends.
+    AMBIENT_MERGE_GAP_S = 2.0
+    pending: dict | None = None  # {speaker, text, start_s, end_s}
+    flush_task: asyncio.Task | None = None
+
+    def _flush_payload(p: dict) -> dict:
+        return {
+            "type": "ambient_segment",
+            "speaker": p["speaker"],
+            "text": p["text"],
+            "start_s": p["start_s"],
+            "end_s": p["end_s"],
+        }
+
+    def _persist(p: dict) -> None:
         store.record_ambient_turn(
             doc_id,
-            speaker_tag=seg.speaker_tag,
-            text=seg.text,
-            start_s=seg.start,
-            end_s=seg.end,
+            speaker_tag=p["speaker"],
+            text=p["text"],
+            start_s=p["start_s"],
+            end_s=p["end_s"],
             now_iso=now(),
         )
-        log_event(
-            session_id,
-            "ambient_segment",
-            speaker=seg.speaker_tag,
-            chars=len(seg.text),
-        )
-        asyncio.run_coroutine_threadsafe(
-            _safe_send({
-                "type": "ambient_segment",
+        log_event(session_id, "ambient_turn", speaker=p["speaker"], chars=len(p["text"]))
+        asyncio.run_coroutine_threadsafe(_safe_send(_flush_payload(p)), loop)
+
+    def _flush_pending() -> None:
+        nonlocal pending
+        if pending is not None:
+            _persist(pending)
+            pending = None
+
+    def _on_segment(seg: DiarizedUtterance) -> None:
+        """Called from the provider's recv task. Never blocks: persistence
+        goes through the store queue; client push is scheduled on the loop."""
+        nonlocal pending, flush_task
+        nonlocal audio_in_bytes  # noqa: F841 — symmetric with voice path
+
+        if (
+            pending is not None
+            and pending["speaker"] == seg.speaker_tag
+            and seg.start - pending["end_s"] <= AMBIENT_MERGE_GAP_S
+        ):
+            pending["text"] = f"{pending['text']} {seg.text}".strip()
+            pending["end_s"] = seg.end
+        else:
+            _flush_pending()
+            pending = {
                 "speaker": seg.speaker_tag,
                 "text": seg.text,
                 "start_s": seg.start,
                 "end_s": seg.end,
-            }),
-            loop,
-        )
+            }
+
+        # Idle flush: if no further segment merges within the gap window,
+        # emit the pending turn (keeps live UI + Firestore fresh).
+        if flush_task is not None:
+            flush_task.cancel()
+        flush_task = loop.create_task(_idle_flush())
+
+    async def _idle_flush() -> None:
+        try:
+            await asyncio.sleep(2.5)
+            _flush_pending()
+        except asyncio.CancelledError:
+            pass
 
     async def _safe_send(payload: dict) -> None:
         with contextlib.suppress(Exception):
@@ -486,7 +528,7 @@ async def ambient_ws_endpoint(
     # lives in the same loop), so run_coroutine_threadsafe is belt-and-braces
     # for loop affinity — cheap and correct either way.
 
-    provider = DeepgramAmbient(on_segment)
+    provider = DeepgramAmbient(_on_segment)
     try:
         await provider.start()
     except Exception as e:  # noqa: BLE001
@@ -523,6 +565,9 @@ async def ambient_ws_endpoint(
         log_event(session_id, "ambient_session_error", error=repr(e))
     finally:
         stop_event.set()
+        _flush_pending()  # emit any pending merged turn before teardown
+        if flush_task is not None:
+            flush_task.cancel()
         if provider is not None:
             await provider.close()
         store.end_session(
