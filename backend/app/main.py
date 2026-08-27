@@ -168,9 +168,13 @@ async def get_session(
     turns = doc.get("turns") or []
     # Ambient turns (Phase 5) pass through with their own shape; voice turns
     # keep the normalized voice shape.
-    if doc.get("mode") == "ambient":
-        turns_out = [
-            {
+    # Phase 5 C+B: a doc may be MIXED — ambient room turns (kind
+    # "ambient") and voice turns (kind "voice"/absent) in one session
+    # document. Shape each turn by ITS OWN kind, not the doc's mode.
+    turns_out = []
+    for t in turns:
+        if t.get("kind") == "ambient":
+            turns_out.append({
                 "id": t.get("id"),
                 "kind": "ambient",
                 "ended_at": t.get("ended_at"),
@@ -178,22 +182,18 @@ async def get_session(
                 "text": t.get("text") or "",
                 "start_s": t.get("start_s"),
                 "end_s": t.get("end_s"),
-            }
-            for t in turns
-        ]
-    else:
-        turns_out = [
-            {
+            })
+        else:
+            turns_out.append({
                 "id": t.get("id"),
+                "kind": "voice",
                 "started_at": t.get("started_at"),
                 "ended_at": t.get("ended_at"),
                 "user_text": t.get("user_text") or "",
                 "assistant_text": t.get("assistant_text") or "",
                 "interrupted": bool(t.get("interrupted")),
                 "reason": t.get("reason"),
-            }
-            for t in turns
-        ]
+            })
     return {
         "id": doc_id,
         **{k: doc.get(k) for k in (
@@ -592,7 +592,7 @@ def _ambient_seed_block(seed: str) -> str:
     """System-instruction block for the C2 ambient room-context seed.
 
     Empty seed -> empty string (no block). The seed arrives from the phone
-    as diarized lines ("S1: …\\nS2: …") — we treat it as live room context
+    as diarized lines ("S1: …\nS2: …") — we treat it as live room context
     the model may REFER to but must not repeat back.
     """
     if not seed.strip():
@@ -602,6 +602,45 @@ def _ambient_seed_block(seed: str) -> str:
         "(speakers S1, S2, …; most recent last). Treat this as live context "
         "for the user's imminent request. You may refer to it, but do not "
         "repeat it back:\n\n" + seed.strip()
+    )
+
+
+def _replay_block(turns: list[dict]) -> str:
+    """System-instruction block built from typed replay turns (Phase 5 C+B).
+
+    Ambient entries ("kind"="ambient") render as room-context lines
+    ``S1: …``; voice entries render as the classic User/You exchange.
+    Empty inputs (or all-empty lines) yield "" so no block is appended.
+    """
+    if not turns:
+        return ""
+    lines: list[str] = []
+    for t in turns:
+        if t.get("kind") == "ambient":
+            text = (t.get("text") or "").strip()
+            if not text:
+                continue
+            lines.append(f"S{t.get('speaker', '?')}: {text}")
+        else:
+            user = (t.get("user_text") or "").strip()
+            assistant = (t.get("assistant_text") or "").strip()
+            if not (user or assistant):
+                continue
+            if user and assistant:
+                lines.append(f"User said: {user}\nYou replied: {assistant}")
+            elif user:
+                lines.append(f"User said: {user}")
+            else:
+                lines.append(f"You replied: {assistant}")
+    if not lines:
+        return ""
+    return (
+        "\n\nThe following is context around this conversation (most "
+        "recent last): room utterances are tagged S1/S2 (speakers in the "
+        "room), 'User' is the person who called you, 'You' is you. Treat "
+        "it as things already said; do not repeat or re-introduce "
+        "yourself:\n\n"
+        + "\n\n".join(lines)
     )
 
 
@@ -653,34 +692,27 @@ async def websocket_endpoint(
     store = get_store()
     doc_id = client_session_id or session_id
 
-    # Transcript-replay fallback (Phase 2): when there is NO live resumption
-    # handle (fresh conversation, expired handle, recycled instance) but this
+    # Transcript-replay fallback (Phase 2 + Phase 5 C+B): when there is NO
+    # live resumption handle (fresh conversation, expired handle, recycled
+    # instance, or a voice leg continuing an ambient room doc) but this
     # client_session_id has past turns in Firestore, inject them into the
-    # system instruction so the model keeps conversational memory. This is
-    # awaited BEFORE the Gemini connect, so it never touches the audio path.
+    # system instruction so the model keeps conversational + room memory.
+    # This is awaited BEFORE the Gemini connect, so it never touches the
+    # audio path. Typed turns: ambient → "S1: …" room context, voice →
+    # User/You exchange.
     replay_block = ""
     if not resumed and client_session_id:
         try:
-            replay_turns = await store.replay_turns(doc_id)
+            replay_entries = await store.replay_turns(doc_id)
         except Exception as e:  # noqa: BLE001 — replay is best-effort
             log_event(session_id, "replay_fetch_error", error=repr(e))
-            replay_turns = []
-        if replay_turns:
-            lines = [
-                f"User said: {t['user_text']}\nYou replied: {t['assistant_text']}"
-                for t in replay_turns
-                if t["user_text"] or t["assistant_text"]
-            ]
-            replay_block = (
-                "\n\nThe following is a transcript of your previous "
-                "conversation with this user (most recent last). Treat it as "
-                "things you already discussed with them; do not repeat or "
-                "re-introduce yourself:\n\n" + "\n\n".join(lines)
-            )
+            replay_entries = []
+        if replay_entries:
+            replay_block = _replay_block(replay_entries)
             log_event(
                 session_id,
                 "transcript_replay",
-                turns_replayed=len(lines),
+                turns_replayed=len(replay_entries),
             )
 
     # Memory injection (Phase 3): bounded block of durable memories +

@@ -231,6 +231,7 @@ class SiriousSessionController extends ChangeNotifier {
     String? seed,
     String? invoke,
     bool duckCapture = false,
+    String? clientSessionId,
   }) async {
     if (_phase.isActive) {
       return;
@@ -238,7 +239,10 @@ class SiriousSessionController extends ChangeNotifier {
 
     _errorMessage = null;
     _sessionId = null;
-    _clientSessionId ??= _generateClientSessionId();
+    // Phase 5 C+B: an ambient invocation REUSES the ambient conversation
+    // id, so the backend continues the SAME Firestore doc (room turns +
+    // answers in one History entry). Normal 1:1 mode generates a fresh id.
+    _clientSessionId = clientSessionId ?? _generateClientSessionId();
     _turns.clear();
     _currentUserText = '';
     _currentAssistantText = '';

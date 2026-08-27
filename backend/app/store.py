@@ -120,12 +120,25 @@ class SessionStore:
         ref = db.collection(SESSIONS_COLLECTION).document(doc_id)
         snap = await ref.get()
         if snap.exists:
-            # Resumed reconnect: extend the existing conversation document.
+            # Resumed reconnect (or Phase 5 C+B: a voice session continuing
+            # an ambient room doc): extend the EXISTING conversation
+            # document AND re-seed the in-memory buffer with its stored
+            # turns + title. Without the re-seed, a fresh buffer would start
+            # at turns=[] and the first new record_turn would clobber the
+            # stored ambient/voice history (a real hit when the ambient
+            # session's end_session popped the buffer before the voice leg
+            # opened).
+            data = snap.to_dict() or {}
+            buf = self._buffer(doc_id)
+            buf["turns"] = list(data.get("turns") or [])
+            buf["started_ms"] = p["updated_ms"]
+            if data.get("title"):
+                buf["title"] = data["title"]
             await ref.set(
                 {
                     "updated_ms": p["updated_ms"],
                     "last_updated_at": p["now_iso"],
-                    "resume_count": snap.to_dict().get("resume_count", 0) + 1,
+                    "resume_count": data.get("resume_count", 0) + 1,
                 },
                 merge=True,
             )
@@ -144,16 +157,29 @@ class SessionStore:
         ]
         buf["turns"].append(p["turn"])
 
+        # Title decided at WRITE time, first-wins: whichever turn (ambient
+        # room utterance or voice user text) arrives first names the doc.
+        # Centralized here so a unified ambient+voice doc keeps the room
+        # title even when voice turns carry no user_text (C2 invoke), and a
+        # re-seeded buffer's stored title is never overridden by a stale
+        # enqueue-time title from before the re-seed landed.
+        if not buf.get("title"):
+            turn = p["turn"]
+            first_text: Any = None
+            if turn.get("kind") == "ambient":
+                first_text = turn.get("text")
+            else:
+                first_text = turn.get("user_text")
+            buf["title"] = make_title(first_text)
+
         merge = {
             "turns": buf["turns"],
             "turn_count": len(buf["turns"]),
             "updated_ms": p["updated_ms"],
             "last_updated_at": p["now_iso"],
         }
-        # Optional extras (e.g. first-turn title) ride along here.
-        for k in ("title",):
-            if p.get(k) is not None:
-                merge[k] = p[k]
+        if buf.get("title"):
+            merge["title"] = buf["title"]
 
         await db.collection(SESSIONS_COLLECTION).document(doc_id).set(
             merge, merge=True
@@ -235,17 +261,10 @@ class SessionStore:
             "end_s": round(float(end_s), 2),
             "ended_at": now_iso,
         }
-        buf = self._buffer(doc_id)
-        if not buf.get("title") and text.strip():
-            buf["title"] = make_title(text)
-            buf["title_pending"] = True
-        extra: dict[str, Any] = {}
-        if buf.pop("title_pending", False) and buf.get("title"):
-            extra["title"] = buf["title"]
         self._enqueue(
             "turn",
             doc_id,
-            {"turn": turn, "updated_ms": _ms(), "now_iso": now_iso, **extra},
+            {"turn": turn, "updated_ms": _ms(), "now_iso": now_iso},
         )
 
     def record_turn(self, doc_id: str, *, summary: dict[str, Any], now_iso: str) -> None:
@@ -261,19 +280,10 @@ class SessionStore:
             "audio_in_bytes": summary.get("audio_in_bytes"),
             "audio_out_bytes": summary.get("audio_out_bytes"),
         }
-        buf = self._buffer(doc_id)
-        if not buf.get("title"):
-            buf["title"] = make_title(turn["user_text"])
-            buf["title_pending"] = True
-
-        extra: dict[str, Any] = {}
-        if buf.pop("title_pending", False) and buf.get("title"):
-            extra["title"] = buf["title"]
-
         self._enqueue(
             "turn",
             doc_id,
-            {"turn": turn, "updated_ms": _ms(), "now_iso": now_iso, **extra},
+            {"turn": turn, "updated_ms": _ms(), "now_iso": now_iso},
         )
 
     def end_session(
@@ -314,14 +324,22 @@ class SessionStore:
         segments of a resumed conversation included). Read synchronously by
         the WS handler at teardown — before queued writes are applied — and
         handed to the memory extractor so IT never races the Phase 2 writer.
+        Ambient-only turns (kind="ambient") are EXCLUDED: room chatter is
+        display/history data, not the user's conversation memory (Phase 5 C+B).
         """
         turns = self._buffer(doc_id).get("turns", [])
-        return [
-            {"id": t.get("id"),
-             "user_text": t.get("user_text") or "",
-             "assistant_text": t.get("assistant_text") or ""}
-            for t in turns
-        ]
+        out = []
+        for t in turns:
+            if t.get("kind") == "ambient":
+                continue
+            if not (t.get("user_text") or t.get("assistant_text")):
+                continue
+            out.append(
+                {"id": t.get("id"),
+                 "user_text": t.get("user_text") or "",
+                 "assistant_text": t.get("assistant_text") or ""}
+            )
+        return out
 
     async def delete_session(self, doc_id: str) -> bool:
         """Hard-delete a conversation document. Returns False if absent."""
@@ -348,18 +366,26 @@ class SessionStore:
         async for s in snaps:
             d = s.to_dict() or {}
             turns = d.get("turns") or []
+            last = turns[-1] if turns else {}
+            # Voice sessions preview the last answer; ambient/mixed docs
+            # fall back to the last room utterance when there is none.
+            preview = None
+            if last.get("assistant_text"):
+                preview = last["assistant_text"][:140]
+            elif last.get("text"):
+                preview = last["text"][:140]
             out.append(
                 {
                     "id": s.id,
                     "title": d.get("title"),
-                    "preview": (turns[-1]["assistant_text"][:140]
-                                if turns and turns[-1].get("assistant_text") else None),
+                    "preview": preview,
                     "started_at": d.get("started_at"),
                     "ended_at": d.get("ended_at"),
                     "duration_s": d.get("duration_s"),
                     "turn_count": d.get("turn_count", len(turns)),
                     "model": d.get("model"),
                     "updated_ms": d.get("updated_ms"),
+                    "mode": d.get("mode"),
                 }
             )
         return out
@@ -373,20 +399,38 @@ class SessionStore:
 
     async def replay_turns(
         self, doc_id: str, limit: int = 12
-    ) -> list[dict[str, str]]:
-        """Most recent turns (oldest→newest) for resume-context replay."""
+    ) -> list[dict[str, Any]]:
+        """Most recent turns (oldest→newest) for resume-context replay.
+
+        Phase 5 C+B: returns TYPED entries so an ambient+voice room doc
+        replays as room context (S1: …) AND conversation (User/You). Each
+        entry has a ``kind``: "ambient" (speaker/text) or "voice"
+        (user_text/assistant_text). Empty turns are dropped.
+        """
         doc = await self.get_session(doc_id)
         if not doc:
             return []
         turns = doc.get("turns") or []
-        return [
-            {
-                "user_text": t.get("user_text") or "",
-                "assistant_text": t.get("assistant_text") or "",
-            }
-            for t in turns[-limit:]
-            if (t.get("user_text") or t.get("assistant_text"))
-        ]
+        out = []
+        for t in turns[-limit:]:
+            if t.get("kind") == "ambient":
+                text = (t.get("text") or "").strip()
+                if not text:
+                    continue
+                out.append(
+                    {"kind": "ambient", "speaker": t.get("speaker"),
+                     "text": text}
+                )
+            else:
+                user = t.get("user_text") or ""
+                assistant = t.get("assistant_text") or ""
+                if not (user or assistant):
+                    continue
+                out.append(
+                    {"kind": "voice", "user_text": user,
+                     "assistant_text": assistant}
+                )
+        return out
 
 
 class NullSessionStore:

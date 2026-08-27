@@ -13,9 +13,9 @@ class AmbientAudioBridge {
   final AmbientSessionController controller;
   AudioCaptureService? _capture;
 
-  Future<void> start() async {
+  Future<void> start({bool clearSegments = true}) async {
     _capture = AudioCaptureService(onChunk: _sendChunk);
-    await controller.start();
+    await controller.start(clearSegments: clearSegments);
     if (controller.phase != AmbientPhase.listening) {
       await _capture?.dispose();
       _capture = null;

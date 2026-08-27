@@ -67,11 +67,18 @@ class AmbientSessionController extends ChangeNotifier {
   bool get isActive =>
       _phase == AmbientPhase.connecting || _phase == AmbientPhase.listening;
 
-  Future<void> start() async {
+  /// Stable conversation id (`amb-…`), generated on first start and reused on
+  /// every reconnect so the backend EXTENDS one Firestore doc. Phase 5 C+B:
+  /// the voice leg reuses this id so room turns + answers land in ONE doc.
+  String? get clientSessionId => _clientSessionId;
+
+  Future<void> start({bool clearSegments = true}) async {
     if (isActive) return;
     _phase = AmbientPhase.connecting;
     _errorMessage = null;
-    _segments.clear();
+    if (clearSegments) {
+      _segments.clear();
+    }
     _stopping = false;
     _clientSessionId ??=
         'amb-${DateTime.now().millisecondsSinceEpoch}-${DateTime.now().microsecond % 1000}';

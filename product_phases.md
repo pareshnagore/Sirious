@@ -77,11 +77,13 @@ Product phases span multiple layers. A single product phase may complete parts o
 ```
 
 **Active focus:** **Phase 5 IN PROGRESS (started 25 Aug 2026)** — ambient & multi-speaker
-mode. C0.5+C1+C2 DONE and on-device verified (echo solved via hard duck). NEXT:
-probe gemini-3.5-transcribe-live (open diarization question) → then C+B UX
-unification (inline answers, unified conversation context/history). Working plan +
-fork alternatives in the Phase 5 section below; echo/barge-in research in
-`docs/echo_bargein_research.md`.
+mode. C0.5+C1+C2 DONE and on-device verified (echo solved via hard duck). C+B
+UX UNIFICATION DONE (26 Aug, code + local E2E PASS): inline answers on the ambient
+screen (no screen swap), voice leg reuses the ambient client_session_id → ONE
+History entry (room + answers), replay as S1/S2 room context, title = first room
+turn. PENDING: on-device verification + prod deploy (then C3 name mapping).
+Working plan + fork alternatives in the Phase 5 section below; echo/barge-in
+research in `docs/echo_bargein_research.md`.
 
 ### Phase 1 progress (17 Aug 2026)
 
@@ -885,31 +887,70 @@ Pending: real-table human gate (Paresh expects positive). C2 starts next session
    Returning to ambient clears the visible segment list (clean slate by design).
 3. **Screen-swap UX** (push/pop Ambient ↔ Invocation) is not fluent.
 
-**OPEN QUESTION (26 Aug): gemini-3.5-transcribe-live — EXISTS, NEVER PROBED.**
-- Live account check: `models/gemini-3.5-transcribe` (generateContent) and
-  `models/gemini-3.5-transcribe-live` (bidiGenerateContent) are BOTH available.
-- Honest gap: our "Gemini can't diarize" conclusion (25 Aug probes) covered
-  Gemini Live (assistant) + STT v2 + chirp_3 — NOT this dedicated transcription
-  model. The old conclusion does NOT automatically apply to it.
-- Decision checklist if we probe it (dedicated probe script, ~30 min, same
-  pattern as stt_probe*.py — stream a 2-speaker Hinglish clip, inspect stream
-  for speaker labels): (1) **speaker diarization in the live stream = make or
-  break** (if absent, dead for ambient); (2) en-IN + hi-IN streaming quality +
-  code-switch vs nova-3 multi; (3) per-utterance finals latency vs our
-  finals-only Deepgram; (4) cost per ambient-hour. If it passes → unseats
-  Deepgram as launch provider (same vendor as voice model, better Hinglish
-  likely). NEXT SESSION: run this probe (discussion closed; no product-code
-  change until probe results).
+**PROBE RESOLVED (26 Aug): gemini-3.5-transcribe(-live) probed — verdict: does NOT
+unseat Deepgram.** Scripts: `backend/stt_probe8*.py` (fixture: 2-speaker Hinglish
+t0–t5, EN/HI alternating; ground truth verified via Deepgram batch S0=EN/S1=HI).
+- **LIVE (`gemini-3.5-transcribe-live`): NO diarization, period.** Streamed the
+  fixture under every config (diarization=True/False, language auto vs pinned
+  en-IN+hi-IN, auto-VAD vs client activity signals via
+  RealtimeInputConfig/AutomaticActivityDetection, aggressive endpointing
+  silence_duration_ms=500). Every run returned clean interims + per-utterance
+  finals, **never a speaker label**; `diarization` flag accepted but inert.
+  → Make-or-break FAILED: dead for ambient multi-speaker.
+- **Live positives (kept for reference):** per-utterance finals stream in real
+  time — default auto-VAD finalizes each turn ~0.2–0.5 s after speech end
+  (generation_complete marks each final; NO turn_complete event ever — client
+  segments on generation_complete + speech gaps). Hinglish quality is strong on
+  this fixture (accurate EN + Devanagari HI, code-switching preserved). Artifact:
+  a final sometimes swallows the first ~2–3 words of the NEXT utterance
+  ("...चाहिए।Okay, "). No transcribe-specific price published; closest 3.5-family
+  audio rate ~$0.0053/min in (≈ Deepgram nova-3 multi $0.0058/min PAYG; roughly a
+  wash). SDK 2.19.0 note: `interactions.create` accepts the dict but
+  GenerateContentConfig lacks transcription_config (extra_forbidden) and the
+  Interaction object hides annotations — use raw REST for annotated reads.
+- **BATCH (`gemini-3.5-transcribe`, REST /v1beta/interactions): diarization EXISTS
+  (per-word `speaker: "spk:0"/"spk:1"` + word offsets) but is NOT trustworthy on
+  code-switched audio yet:** on this fixture Gemini annotated ONLY the English
+  words (32/65; all Hindi tokens absent from annotations) and split the EN
+  speaker across two labels (t0+t4→spk:0, t2→spk:1) — while Deepgram batch
+  diarized all 65 words perfectly. → room-history diarization stays Deepgram.
+- **Decision:** Deepgram (streaming diarized finals + batch diarized offline)
+  remains the Phase 5 launch provider. Gemini transcribe-live is NOT adopted;
+  keep Google STT v2 as transcription-only fallback only. No product-code change.
+  C+B UX unification (inline answers, unified context) is now unblocked and is
+  the next work item.
 
-**PLANNED NEXT after probe — C+B UX unification (discussed 26 Aug, pending):**
-- **C (UX):** kill the screen swap — stay on ambient screen, render the answer
-  as an inline assistant bubble (room transcript scrolling under it), duck mic,
-  auto-continue listening after. One screen, one session, one History entry.
-- **B (context/history):** reuse the ambient client_session_id for the voice
-  leg; backend replay injects ambient turns as room context ("S1: …", "S2: …")
-  into the system instruction; title falls back to first ambient turn. Result:
-  one History entry per table session (room transcript + all answers), follow-up
+**C+B UX UNIFICATION — DONE 26 Aug 2026 (backend + mobile, local E2E PASS).**
+- **C (UX):** screen swap KILLED. AmbientSessionScreen now renders invocations
+  inline: room transcript keeps scrolling under an "answer" section (Room
+  request bubble + Sirious bubbles from the voice controller), mic ducked
+  while answering (C2.5 step 1), auto-return to ambient after playback drains
+  (queue empty + 2.5 s settle + listening). InvocationScreen DELETED. Auto-
+  scroll to bottom when near the tail; "Stop answering" button replaces the
+  ambient toggle while a voice session is live; failed voice starts fall back
+  to ambient automatically.
+- **B (context/history):** the voice leg REUSES the ambient client_session_id
+  (startSession gains a clientSessionId override; ambient controller exposes
+  it; ambient restart after an answer keeps segments with clearSegments:false).
+  Backend: `store.replay_turns` is now TYPED (kind ambient → S1: … / kind
+  voice → User/You); /ws builds the replay block from BOTH via new
+  `_replay_block()`; GET /sessions/{id} shapes turns by THEIR OWN kind
+  (mixed docs render correctly in History); title = first room turn (decided
+  at WRITE time in `_apply_turn`, first-wins across ambient+voice — removed
+  the stale enqueue-time capture that could override the room title);
+  `_apply_start` re-seeds the in-memory buffer from Firestore when a voice
+  session continues an existing doc (CRITICAL: without it the fresh buffer
+  would clobber stored ambient turns); snapshot_turns excludes ambient-only
+  turns from memory extraction; list_sessions preview falls back to the last
+  room utterance. Result: ONE History entry per table session, follow-up
   invocations seeded with the full conversation, no "(no speech captured)".
+- Verified: backend tests 138 pass (8 new in tests/test_phase5_cb.py);
+  flutter analyze clean; flutter test 8 pass; local E2E (backend/cb_e2e.py)
+  PASS — 3 ambient segments → same-id voice answer → GET shows mode=ambient,
+  title=first room turn, kinds [ambient×3, voice], transcript_replay=3 in
+  server logs; probe doc deleted.
+- PENDING: on-device real-table verification + prod deploy (explicit
+  go-ahead), then History title/badge polish if wanted, then C3.
 - Separate quick wins: stream interims as live hints (fix latency/first-sentence
   feel without C1 duplicates — interims never persisted); single-language en-IN
   experiment; AssemblyAI bake-off if Gemini probe fails diarization.
