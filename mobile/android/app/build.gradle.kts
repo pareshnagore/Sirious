@@ -24,6 +24,14 @@ android {
     compileSdk = 37
     ndkVersion = flutter.ndkVersion
 
+    // Phase 6 Stage A: native AEC3 (webrtc-audio-processing) via CMake.
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
@@ -38,6 +46,19 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        ndk {
+            // Phone (SM-E346B) is arm64-only for our purposes.
+            abiFilters += listOf("arm64-v8a")
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += listOf(
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_MAKE_PROGRAM=D:\\Hermes\\tools\\ninja\\ninja.exe"
+                )
+            }
+        }
     }
 
     signingConfigs {
