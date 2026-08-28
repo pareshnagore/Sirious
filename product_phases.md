@@ -1,6 +1,6 @@
 # Sirious — Product Phases
 
-**Date:** 16 August 2026  
+**Date:** 16 August 2026 · **Last updated:** 28 Aug 2026 — goal pivot: Phase 5 parked, Phase 6 (single-user speaker mode) active.  
 **Purpose:** Map the long-term Sirious vision to incremental, shippable phases. Use this to avoid scope creep and to decide what belongs in the current milestone vs later work.
 
 ---
@@ -42,14 +42,16 @@ Product phases span multiple layers. A single product phase may complete parts o
 | Phase 2       | Layer 3–4                  |
 | Phase 3       | Layer 4–5                  |
 | Phase 4       | Layer 5–6                  |
-| Phase 5       | Layer 6–7                  |
-| Phase 6       | Cross-cutting (new modalities) |
+| Phase 5       | Layer 6–7 (parked 28 Aug) |
+| Phase 6       | Layer 1–3 (audio DSP + speaker-mode UX) |
+| Phase 7       | Cross-cutting (identity) |
+| Phase 8       | Cross-cutting (team assistant) |
 
 ---
 
 **Current status**
 
-**Phase 3 (contextual memory) is complete — deployed, recall-test PASS in prod, user-accepted on device (22 Aug 2026).**
+**Phase 4 (tools & actions) is complete — reminders E2E on device, Phase 4 closed 24 Aug 2026. GOAL PIVOT 28 Aug 2026: Phase 5 (ambient multi-speaker) PARKED after the office trial — Deepgram laggy, dropped sentences; active goal is now Phase 6 — single-user speaker mode.**
 
 ```text
 ✅ Cloud Run WebSocket bridge
@@ -73,92 +75,18 @@ Product phases span multiple layers. A single product phase may complete parts o
    both tools live-proven in prod (structured logs + spoken answers)
 ✅ Reminders end-to-end (Phase 4 closed 24 Aug): voice draft→confirm→
    Cloud Tasks→OIDC fire→FCM→tray notification+badge, on-device verified
-❌ Multi-speaker (Phase 5 — started 25 Aug 2026), vision
+⏸ Multi-speaker ambient (Phase 5) — PARKED 28 Aug 2026 after the office trial; vision not started
 ```
 
-**Active focus:** **Phase 5 IN PROGRESS (started 25 Aug 2026)** — ambient & multi-speaker
-mode. C0.5+C1+C2 DONE and on-device verified (echo solved via hard duck). C+B
-UX UNIFICATION DONE (26 Aug, code + local E2E PASS): inline answers on the ambient
-screen (no screen swap), voice leg reuses the ambient client_session_id → ONE
-History entry (room + answers), replay as S1/S2 room context, title = first room
-turn. PENDING: on-device verification + prod deploy (then C3 name mapping).
-Working plan + fork alternatives in the Phase 5 section below; echo/barge-in
-research in `docs/echo_bargein_research.md`.
-
-### Phase 1 progress (17 Aug 2026)
-
-```text
-✅ Flutter Android client builds (debug APK) & installs on physical device (SM E346B, Android 16)
-✅ WebSocket v1 client (binary audio + JSON events) matching backend/docs/websocket_protocol.md
-✅ Mic capture (16 kHz PCM) → send; receive → playback queue → speaker; event handler
-✅ Client state machine IDLE→CONNECTING→LISTENING⇄RESPONDING/PLAYING
-✅ Playback cancellation on `interrupted` (clear queue + flush)
-✅ Transcript fragments aggregated per turn (not word-by-word)
-✅ Basic session UX: connect, listening indicator, end session
-✅ Latency timestamps (T0–T3) shown in UI
-✅ FIXED: no audio on follow-up sessions (flutter_pcm_sound _needsStart not reset by release+setup;
-  keep engine warm across sessions, feed via direct drain)
-✅ FIXED: transcript text was persisting across sessions (now cleared at session start)
-✅ FIXED (19 Aug): app survives brief network blips — auto-reconnects to a fresh
-  server/Gemini session (client-side, exponential backoff 1s→8s, 5 attempts) and
-  resumes Listening; mid-utterance partial turn committed so nothing is lost;
-  keepalive ping + stall watchdog catches sockets that silently stop; verified live
-  (airplane-mode toggle: Listening → Reconnecting → Listening, transcript preserved)
-✅ Barge-in latency measured on device (target ~200–500 ms) — user-verified 21 Aug:
-   interruption behavior BETTER on gemini-3.1-flash-live than the 2.5 native-audio model
-✅ Full "smooth voice experience" acceptance on device — user-accepted 21 Aug
-✅ Release APK (signed) — built & verified on 20 Aug 2026 (see "Android build/keystore" below)
-✅ Upstream protocol/docs re-verification — done 21 Aug (official Live session-management
-   docs cross-checked; websocket_protocol.md updated to v2: session resumption)
-✅ BONUS (Phase 2 item pulled forward): session resumption across network blips —
-   implemented + user-verified on device 21 Aug; prod runs gemini-3.1-flash-live
-   (SIRIOUS_MODEL env var) since 2.5-native-audio never emits resumable handles
-```
-
-### Android build toolchain + keystore (20 Aug 2026)
-
-> **For other agents/PCs:** before any `flutter build` on a fresh machine, read this. The
-> project **cannot** be built with the default toolchain of an old Flutter — it needs the
-> versions below. If a build fails, check these first.
-
-- **Flutter SDK ≥ 3.47** (Dart ≥ 3.11). Older Flutter (e.g. 3.35) fails `pub get` because
-  `path_provider` needs Dart ≥ 3.10.
-- **Gradle 9.3.1**, **AGP 9.1.0**, **Kotlin 2.4.0** — pinned in
-  `mobile/android/gradle/wrapper/gradle-wrapper.properties` and
-  `mobile/android/settings.gradle.kts`. These are Flutter 3.47's *tested defaults* —
-  don't downgrade them. They're needed because Flutter uses Android Studio's bundled JBR
-  (Java 25), and old Gradle (8.14) cannot run on Java 25.
-- **No JDK install needed** — Java 25 comes from Android Studio's bundled JBR
-  (`/Applications/Android Studio.app/Contents/jbr`). Gradle 9.3.1 supports it.
-- **Android build-tools 37.0.0** must be installed (`sdkmanager "build-tools;37.0.0"`)
-  — the build needs `platforms/android-37` + build-tools 37 for `compileSdk = 37`.
-
-**`flutter_pcm_sound` compileSdk patch (IMPORTANT, easy to miss):**
-- `flutter_pcm_sound` 3.3.3 (latest) ships `compileSdkVersion 33`, but its transitive
-  AndroidX deps require android-34+. Build fails with
-  `:flutter_pcm_sound:checkDebugAarMetadata` / `CheckAarMetadataWorkAction`.
-- **Fix:** edit `~/.pub-cache/hosted/pub.dev/flutter_pcm_sound-3.3.3/android/build.gradle`
-  → `compileSdkVersion 37`. ⚠️ This lives in the pub cache, **not** the repo — a fresh
-  `flutter pub get` reverts it. Vendor the plugin or ask the maintainer before a real
-  distribution.
-
-**Signing / keystore (do NOT commit to this repo — it is PUBLIC):**
-- Release keystore: `mobile/android/app/upload-keystore.jks`
-  (alias `sirious`). Passwords: `mobile/android/key.properties`.
-- **Both are gitignored** and must stay out of the public GitHub repo (see below).
-- `mobile/android/app/build.gradle.kts` loads them, falls back to debug signing
-  if `key.properties` is absent (so a fresh clone still builds).
-- **Back these up off-machine** — losing the keystore means you can never update the app
-  under `com.sirious.sirious`.
-
-**Remote push from this machine (important):**
-- The local agent (Claude Code) does **not** push to GitHub — the user has a
-  **fine-grained Personal Access Token** for `git push` and their credentials are not
-  available to the agent. Agents commit locally; **the user pushes** (or a token-based
-  `git push` via `gh`/the user).
-- The GitHub repo `pareshnagore/Sirious` is **public**.
-
----
+**Active focus:** **Phase 6 — single-user speaker mode (started 28 Aug 2026, branch
+`speaker-mode`).** ONE normal Gemini Live session on loudspeaker — the main-session
+experience Paresh rates consistently good — with software AEC (WebRTC APM/AEC3 via
+dart:ffi) cancelling Sirious's own playout from the mic, so capture stays open during
+answers and barge-in works on speaker. No Deepgram / ambient side-STT in the path.
+Stage A = APM spike with an explicit kill-switch (AEC3 latency tracking). Phase 5
+ambient multi-speaker is PARKED (28 Aug) — code dormant, research intact; see the
+pivot note atop the Phase 5 section. Echo/barge-in research:
+`docs/echo_bargein_research.md`.
 
 ## Phase 0 — Prove the voice pipe (DONE)
 
@@ -253,11 +181,11 @@ User opens app → taps to start session → speaks naturally → hears response
 
 ### Success criteria
 
-- [ ] Voice conversation works on a physical Android device
-- [ ] Barge-in feels immediate (user hears assistant stop within ~200–500 ms of interrupting)
-- [ ] App survives brief network blips without crashing
-- [ ] Transcripts display coherently per turn
-- [ ] End-to-end latency measured and logged on device
+- [x] Voice conversation works on a physical Android device
+- [x] Barge-in feels immediate (user hears assistant stop within ~200–500 ms of interrupting)
+- [x] App survives brief network blips without crashing
+- [x] Transcripts display coherently per turn
+- [x] End-to-end latency measured and logged on device
 
 ### Dependencies
 
@@ -268,6 +196,82 @@ User opens app → taps to start session → speaks naturally → hears response
 - Android audio permissions, background recording, Bluetooth/ speakerphone echo
 - WebSocket + binary frame handling in Flutter
 - Cloud Run cold start adding first-connection delay
+
+### Progress (17–21 Aug 2026 — Phase 1 closed 21 Aug)
+
+```text
+✅ Flutter Android client builds (debug APK) & installs on physical device (SM E346B, Android 16)
+✅ WebSocket v1 client (binary audio + JSON events) matching backend/docs/websocket_protocol.md
+✅ Mic capture (16 kHz PCM) → send; receive → playback queue → speaker; event handler
+✅ Client state machine IDLE→CONNECTING→LISTENING⇄RESPONDING/PLAYING
+✅ Playback cancellation on `interrupted` (clear queue + flush)
+✅ Transcript fragments aggregated per turn (not word-by-word)
+✅ Basic session UX: connect, listening indicator, end session
+✅ Latency timestamps (T0–T3) shown in UI
+✅ FIXED: no audio on follow-up sessions (flutter_pcm_sound _needsStart not reset by release+setup;
+  keep engine warm across sessions, feed via direct drain)
+✅ FIXED: transcript text was persisting across sessions (now cleared at session start)
+✅ FIXED (19 Aug): app survives brief network blips — auto-reconnects to a fresh
+  server/Gemini session (client-side, exponential backoff 1s→8s, 5 attempts) and
+  resumes Listening; mid-utterance partial turn committed so nothing is lost;
+  keepalive ping + stall watchdog catches sockets that silently stop; verified live
+  (airplane-mode toggle: Listening → Reconnecting → Listening, transcript preserved)
+✅ Barge-in latency measured on device (target ~200–500 ms) — user-verified 21 Aug:
+   interruption behavior BETTER on gemini-3.1-flash-live than the 2.5 native-audio model
+✅ Full "smooth voice experience" acceptance on device — user-accepted 21 Aug
+✅ Release APK (signed) — built & verified on 20 Aug 2026 (see "Android build/keystore" below)
+✅ Upstream protocol/docs re-verification — done 21 Aug (official Live session-management
+   docs cross-checked; websocket_protocol.md updated to v2: session resumption)
+✅ BONUS (Phase 2 item pulled forward): session resumption across network blips —
+   implemented + user-verified on device 21 Aug; prod runs gemini-3.1-flash-live
+   (SIRIOUS_MODEL env var) since 2.5-native-audio never emits resumable handles
+```
+
+### Android build toolchain + keystore (20 Aug 2026)
+
+> **For other agents/PCs:** before any `flutter build` on a fresh machine, read this. The
+> project **cannot** be built with the default toolchain of an old Flutter — it needs the
+> versions below. If a build fails, check these first.
+
+- **Flutter SDK ≥ 3.47** (Dart ≥ 3.11). Older Flutter (e.g. 3.35) fails `pub get` because
+  `path_provider` needs Dart ≥ 3.10.
+- **Gradle 9.3.1**, **AGP 9.1.0**, **Kotlin 2.4.0** — pinned in
+  `mobile/android/gradle/wrapper/gradle-wrapper.properties` and
+  `mobile/android/settings.gradle.kts`. These are Flutter 3.47's *tested defaults* —
+  don't downgrade them. They're needed because Flutter uses Android Studio's bundled JBR
+  (Java 25), and old Gradle (8.14) cannot run on Java 25.
+- **No JDK install needed** — Java 25 comes from Android Studio's bundled JBR
+  (`/Applications/Android Studio.app/Contents/jbr`). Gradle 9.3.1 supports it.
+- **Android build-tools 37.0.0** must be installed (`sdkmanager "build-tools;37.0.0"`)
+  — the build needs `platforms/android-37` + build-tools 37 for `compileSdk = 37`.
+
+**`flutter_pcm_sound` compileSdk patch (IMPORTANT, easy to miss):**
+- `flutter_pcm_sound` 3.3.3 (latest) ships `compileSdkVersion 33`, but its transitive
+  AndroidX deps require android-34+. Build fails with
+  `:flutter_pcm_sound:checkDebugAarMetadata` / `CheckAarMetadataWorkAction`.
+- **Fix:** edit `~/.pub-cache/hosted/pub.dev/flutter_pcm_sound-3.3.3/android/build.gradle`
+  → `compileSdkVersion 37`. ⚠️ This lives in the pub cache, **not** the repo — a fresh
+  `flutter pub get` reverts it. Vendor the plugin or ask the maintainer before a real
+  distribution.
+
+**Signing / keystore (do NOT commit to this repo — it is PUBLIC):**
+- Release keystore: `mobile/android/app/upload-keystore.jks`
+  (alias `sirious`). Passwords: `mobile/android/key.properties`.
+- **Both are gitignored** and must stay out of the public GitHub repo (see below).
+- `mobile/android/app/build.gradle.kts` loads them, falls back to debug signing
+  if `key.properties` is absent (so a fresh clone still builds).
+- **Back these up off-machine** — losing the keystore means you can never update the app
+  under `com.sirious.sirious`.
+
+**Remote push from this machine (important):**
+- The local agent (Claude Code) does **not** push to GitHub — the user has a
+  **fine-grained Personal Access Token** for `git push` and their credentials are not
+  available to the agent. Agents commit locally; **the user pushes** (or a token-based
+  `git push` via `gh`/the user).
+- The GitHub repo `pareshnagore/Sirious` is **public**.
+
+---
+
 
 ---
 
@@ -473,7 +477,7 @@ topics, not just keywords.
 
 ---
 
-## Phase 4 — Tools & actions (IN PROGRESS — v1 deployed 23 Aug 2026)
+## Phase 4 — Tools & actions (DONE 24 Aug 2026 — closed with reminders E2E on device)
 
 ### Goal
 
@@ -510,9 +514,9 @@ Sirious: [ searches, summarizes verbally ]
 
 ### Success criteria
 
-- [ ] At least two tools work reliably via voice ← **web_search + add_note pass in prod probes; pending Paresh's on-device voice verification**
-- [ ] User is informed before irreversible actions ← scaffolded (`requires_confirmation` flag); no shipped tool needs it yet
-- [ ] Tool failures degrade gracefully (spoken error, no crash) ← verified: handler errors become structured payloads, model speaks a graceful fallback
+- [x] At least two tools work reliably via voice ← **web_search + add_note PASS in prod probes (23 Aug); reminders tool fully verified on device 24 Aug — phase closed**
+- [x] User is informed before irreversible actions ← scaffolded (`requires_confirmation` flag); no shipped tool needs it yet
+- [x] Tool failures degrade gracefully (spoken error, no crash) ← verified: handler errors become structured payloads, model speaks a graceful fallback
 
 ### Progress (23 Aug 2026 — v1 built, deployed rev 00030, live-proven)
 
@@ -542,9 +546,8 @@ Sirious: [ searches, summarizes verbally ]
    news from live results (tool_called→tool_result ok, 2.5 s);
    add_note saved "filter coffee place in Indiranagar" with model-chosen
    topic "coffee plans" (outcome ok) — both visible in structured logs
-❌ Paresh's on-device voice verification of both tools
-❌ Reminders — direction AGREED 23 Aug: FCM push + Cloud Tasks one-shot
-   scheduling (no polling). Deferred out of v1 deliberately.
+✅ Closed with the phase (24 Aug): the reminders chain was verified end-to-end on device (voice draft → confirm → Cloud Tasks → fire → FCM tray + badge) — the flagship on-device voice validation of Phase 4.
+✅ Reminders — DONE 24 Aug: FCM push + Cloud Tasks one-shot scheduling; chunks 1–4 deployed + on-device verified (detailed below).
 ```
 
 #### Reminders — chunk 1 built locally (23 Aug 2026, NOT yet deployed)
@@ -704,7 +707,24 @@ Gemini Live remains the **voice front door**. Tools run in a **server-side agent
 
 ---
 
-## Phase 5 — Ambient & multi-speaker mode (IN PROGRESS — started 25 Aug 2026)
+## Phase 5 — Ambient & multi-speaker mode (PARKED 28 Aug 2026 — code dormant, not removed; started 25 Aug 2026)
+
+> **PIVOT — Phase 5 PARKED (28 Aug 2026), not abandoned.** First real-office use
+> showed the core tradeoff: the ambient side-STT path (Deepgram nova-3 multi) was
+> LAGGY and dropped whole sentences, while the main 1:1 Gemini Live session
+> (earphones) has consistently felt good. Decision: the active goal is now Phase 6
+> — single-user speaker mode (one normal Gemini session on loudspeaker, software
+> AEC, no side-STT). Everything below STAYS: C0.5–C2 + C+B unification are done
+> and deployable, the Deepgram/ambient module remains in the codebase dormant,
+> and the probe facts (no live diarization in Gemini; Deepgram batch diarization
+> quality) remain the authoritative research for any future room-capture push.
+> C+B unification's pending on-device/prod step is dropped with the pivot.
+> Revisit trigger: per-speaker attribution / room capture becomes a product
+> requirement again. Notes-per-speaker escalation order if that happens:
+> name-declaration (zero ML) → speaker-CHANGE detection (pyannote/diart or NeMo
+> Sortformer streaming; Gemini stays the source of truth for words) →
+> identification (ECAPA-TDNN / Resemblyzer, needs enrollment) — see Phase 6's
+> later add-on note.
 
 ### Goal
 
@@ -984,7 +1004,7 @@ t0–t5, EN/HI alternating; ground truth verified via Deepgram batch S0=EN/S1=HI
 **C5 — Hardening & docs**
 - Noisy-room testing, battery/heat on device, cost instrumentation (ambient
   minutes logged per session), protocol docs v3 (ambient mode + events), phase
-  gate checklist, then Phase 6 (voiceprint identity) builds on C3's mapping.
+  gate checklist, then Phase 7 (voiceprint identity) builds on C3's mapping.
 
 ### Scope
 
@@ -996,7 +1016,7 @@ t0–t5, EN/HI alternating; ground truth verified via Deepgram batch S0=EN/S1=HI
 - Ducking ladder for answer-time echo (C2.5)
 
 **Out (still):**
-- Automatic voice fingerprinting (Phase 6, after C3)
+- Automatic voice fingerprinting (Phase 7, after C3 — C3 itself parked with Phase 5)
 - Face recognition, vision
 - Proactive unsolicited interjections
 - Full-duplex group barge-in (unless C2.5 step 4 ever triggers)
@@ -1023,7 +1043,121 @@ t0–t5, EN/HI alternating; ground truth verified via Deepgram batch S0=EN/S1=HI
 
 ---
 
-## Phase 6 — People recognition (VOICE & VISION) (FUTURE)
+## Phase 6 — Single-user speaker mode (ACTIVE — started 28 Aug 2026, branch `speaker-mode`)
+
+### Goal
+
+Sirious usable **on the loudspeaker, hands-free** — phone on the table, ONE normal
+Gemini Live session (the main-session experience Paresh rates consistently good),
+mic open even while Sirious answers, true barge-in on speaker. No Deepgram, no
+ambient side-STT anywhere in the path. Multiple people talking are treated as one
+user stream.
+
+### Why this became the goal (28 Aug 2026 pivot from Phase 5)
+
+- Office trial verdict: the ambient side-STT (Deepgram nova-3 multi) was laggy and
+  dropped whole sentences; the earphone main session has been consistently good.
+  The quality gap IS the architecture: the ambient path interposes
+  STT → transcript → invoke in front of Gemini; the main session is Gemini's
+  native audio loop end-to-end.
+- The chosen goal does NOT need diarization (single-user semantics) — which
+  removes the exact capability Gemini Live lacks (no live diarization, probed
+  26 Aug).
+- Enabler: software AEC (WebRTC AudioProcessing Module / AEC3) on-device with the
+  REAL playback signal as the far-end reference. Sidesteps the Samsung
+  call-pipeline trap (C0.5): needs neither voiceCommunication source nor
+  MODE_IN_COMMUNICATION — capture stays on MIC, playback stays on the normal route.
+
+### Architecture
+
+```text
+mic PCM (16 kHz) ──┐
+                   ├─► WebRTC APM (AEC3) ─ cleaned mic ─► existing /ws
+playback PCM ──────┘   (far-end reference)                   (ONE Gemini Live
+   (our own playout)                                          session, 24 kHz out)
+```
+
+- `record` + `flutter_pcm_sound` unchanged; no WebRTC transport, no protocol change.
+- Ambient/Deepgram module stays in the codebase DORMANT (Phase 5 parked, not removed).
+
+### Chunked working plan (each stage independently testable)
+
+**Stage A — APM spike (the critical unknown; do FIRST)**
+- Build standalone `webrtc-audio-processing` (AEC3) for Android via CMake/NDK;
+  bind a minimal C ABI and call it from Dart via dart:ffi. No mature Flutter
+  plugin exists — we own the thin wrapper.
+- Harness first (recorded mic+playback overlap fixture), then live on-device:
+  Sirious speaks on loudspeaker; verify the far-end is actually removed from the
+  post-APM mic stream.
+- Exit: measurable echo suppression on SM-E346B.
+- **KILL-SWITCH:** if AEC3 cannot track this device's variable playback latency
+  (its known weak spot), STOP — hard-duck remains the answer-time strategy and
+  speaker mode ships ducking-only (Phase 5 C2.5 step 2/3 becomes the follow-up).
+
+**Stage B — wire into the capture path**
+- `AudioCaptureService` output passes through the APM before the WS;
+  `AudioPlaybackService` PCM feeds the render/reference leg. Far-field ambient
+  profile untouched.
+- Hard duck becomes the FALLBACK, not the primary mechanism, in near-talk
+  speaker use.
+
+**Stage C — speaker-mode session UX**
+- Mic stays open during answers; verify true barge-in mid-answer on loudspeaker.
+- On-device test loop per the standing device-test protocol (install → test card
+  → check logs/screen → iterate, no hand-back between iterations).
+- Exit: earphone-grade experience on speaker, hands-free, daily-use acceptance.
+
+### Later add-on (zero ML): notes-per-speaker by name declaration
+
+When per-speaker notes first matter: speakers SAY their names before talking
+("This is Paresh talking") — Gemini attributes facts/notes from the transcript.
+No diarization pipeline. Escalation if that proves fragile (agreed 28 Aug):
+speaker-CHANGE detection as a notes-metadata layer (pyannote.audio/diart or NeMo
+Sortformer streaming) with Gemini remaining the source of truth for words; full
+identification (ECAPA-TDNN via SpeechBrain, or Resemblyzer — lighter) only after
+enrollment exists. Change-detection ≠ identification: the first says "someone new
+spoke", the second needs enrolled voices to say "that's Paresh". Realistic
+constraints if escalated: ~0.5–1 s event latency (fine for notes, not for
+conversation), overlapping speech degrades all of them, and CPU/GPU cost on
+Cloud Run is the sizing question.
+
+### Scope
+
+**In:**
+
+- ONE Gemini Live session on loudspeaker (normal /ws path)
+- AEC3 via standalone APM + dart:ffi (no transport migration)
+- Mic open during answers; barge-in on speaker
+- No STT vendor in the path
+
+**Out:**
+
+- Multi-speaker diarization / attribution (Phase 5, parked)
+- Any WebRTC transport migration (audio processing only)
+- Server-side AEC (parked permanently — no reference channel exists there)
+- Name declaration / notes-per-speaker (later add-on, above)
+
+### Success criteria
+
+- [ ] Stage A: on-device fixture shows the far-end removed from the mic stream
+- [ ] No ghost turns from Sirious's own speech in speaker mode (parity with the
+  C2.5 hard-duck fix)
+- [ ] True barge-in mid-answer on loudspeaker
+- [ ] Earphone 1:1 mode shows zero regression
+- [ ] Paresh daily-use acceptance on speaker
+
+### Risks
+
+- AEC3 latency tracking on SM-E346B — the reason Stage A goes first and has a
+  kill-switch
+- NDK/CMake inside the Flutter gradle pipeline can break APK builds — isolated on
+  the `speaker-mode` branch; `dev` stays deployable
+- Under-cancellation → own-voice false barge-in — the existing onset+debounce
+  detector and hard-duck remain as fallbacks
+
+---
+
+## Phase 7 — People recognition (VOICE & VISION) (FUTURE)
 
 ### Goal
 
@@ -1047,14 +1181,14 @@ Later meeting:
 
 **In:**
 
-**Voice (Phase 6a):**
+**Voice (Phase 7a):**
 
 - Enrollment flow: user introduces person + short voice sample
 - Voice embedding storage per person
 - Match incoming speech segments to enrolled profiles (confidence threshold)
 - Graceful fallback: "Unknown speaker" when confidence low
 
-**Vision (Phase 6b):**
+**Vision (Phase 7b):**
 
 - On-demand camera snapshot (not continuous video stream initially)
 - Face detection + optional face embedding match against enrolled profiles
@@ -1075,17 +1209,17 @@ Later meeting:
 ### Dependencies
 
 - Phase 5 diarization infrastructure (C1 segments + C3 name mapping — the labels
-  Phase 6a replaces with enrolled identities)
+  Phase 7a replaces with enrolled identities; Phase 5 currently parked — labels arrive if/when it is revived)
 - Strong privacy/consent framework from Phase 2–3
 
 > **Note (25 Aug 2026):** vendor diarization (Google/Deepgram/Assembly) produces
-> speaker *labels*, not reusable voice embeddings — so Phase 6a still needs its own
+> speaker *labels*, not reusable voice embeddings — so Phase 7a still needs its own
 > embedder (enrollment + matching) regardless of which STT vendor won. The coupling
 > to Phase 5 is at the transcript-segment level, not the audio level.
 
 ---
 
-## Phase 7 — Team lead & project assistant (FUTURE)
+## Phase 8 — Team lead & project assistant (FUTURE)
 
 ### Goal
 
@@ -1106,7 +1240,7 @@ Later:
 
 **In:**
 
-- Task entity linked to people (from Phase 3 memory + Phase 6 identity)
+- Task entity linked to people (from Phase 3 memory + Phase 7 identity)
 - Project/team structure (manual setup at first)
 - Status check-ins via voice
 - Integration with task tracker (Linear, Jira, Notion — pick one)
@@ -1131,13 +1265,13 @@ Regardless of excitement about the north star, **do not start** these until thei
 
 | Feature | Wait until |
 |---------|------------|
-| Voice fingerprinting (Peter/Jack) | Phase 6, after Phase 5 diarization + C3 name mapping |
-| In-app software AEC (SpeexDSP/AEC3) | C2.5 step 4 — only if partial-duck barge-in annoys in daily use |
-| Camera / face ID | Phase 6b, after voice identity works |
+| Voice fingerprinting (Peter/Jack) | Phase 7, after Phase 5 revival (parked) + C3 name mapping |
+| In-app software AEC (WebRTC AEC3) | ~~C2.5 step 4~~ TRIGGERED — now Phase 6 Stage A (active 28 Aug) |
+| Camera / face ID | Phase 7b, after voice identity works |
 | Long-term memory | Phase 3, after Phase 2 persistence |
 | Calendar/email/tools | Phase 4, after Phase 3 memory |
-| Multi-speaker table mode | Phase 5, after Phase 1 mobile is solid |
-| Autonomous agent | Phase 7, after tools are reliable |
+| Multi-speaker table mode | PARKED with Phase 5 — revive only if room capture becomes the goal |
+| Autonomous agent | Phase 8, after tools are reliable |
 | Rewriting `main.py` / test client | Only for protocol bugs or new phase requirements |
 | 8-minute session auto-resume | Phase 2 (before long meeting use cases) |
 
@@ -1161,15 +1295,16 @@ These are engineering estimates for a solo/small team, not commitments.
 | Phase | Focus | Rough effort |
 |-------|-------|--------------|
 | 0 | Voice pipe | Done |
-| 1 | Flutter mobile client | 2–4 weeks |
-| 2 | Transcript persistence | 2–3 weeks |
-| 3 | Memory extraction & retrieval | 4–6 weeks |
-| 4 | Tools (2–3 integrations) | 4–6 weeks |
-| 5 | Multi-speaker ambient mode | 6–10 weeks |
-| 6 | Voice/vision identity | 8–12+ weeks |
-| 7 | Team/project assistant | Ongoing |
+| 1 | Flutter mobile client | Done (21 Aug) |
+| 2 | Transcript persistence | Done (22 Aug) |
+| 3 | Memory extraction & retrieval | Done (22 Aug) |
+| 4 | Tools & reminders | Done (24 Aug) |
+| 5 | Multi-speaker ambient mode | C0.5–C2 done; PARKED 28 Aug |
+| 6 | Single-user speaker mode | ACTIVE (Stage A gates the rest) |
+| 7 | Voice/vision identity | 8–12+ weeks (future) |
+| 8 | Team/project assistant | Ongoing (future) |
 
-Phases 5–7 are research-heavy. Expect iteration and partial delivery within each phase.
+Phase 6 is build-heavy (NDK/DSP) — Stage A gates the rest. Phases 7–8 are research-heavy; expect iteration and partial delivery within each.
 
 ---
 
@@ -1183,17 +1318,17 @@ Phases 5–7 are research-heavy. Expect iteration and partial delivery within ea
 | Interrupt assistant while speaking | 1 |
 | Remembers conversations | 2 (raw) → 3 (semantic) |
 | Brainstorm alone from past talks | 2 |
-| Silent unless asked | 1 (basic) → 5 (ambient group) |
+| Silent unless asked | 1 (basic) → 5 (ambient, parked) → 6 (speaker mode) |
 | Listen to group on table | 5 |
-| Introduce Peter/Jack by name | 5 (manual) → 6 (voice learning) |
-| Learn voice/tone over time | 6 |
-| Vision / identify people by sight | 6b |
-| Manage team tasks | 7 |
-| Complete context like a team member | 3 + 5 + 7 (accumulated) |
+| Introduce Peter/Jack by name | 6 (name declaration, zero ML) → 7 (voice learning) |
+| Learn voice/tone over time | 7 |
+| Vision / identify people by sight | 7b |
+| Manage team tasks | 8 |
+| Complete context like a team member | 3 + 5 + 7 + 8 (accumulated) |
 | Take actions (tools) | 4 |
 
 ---
 
 ## One-line summary
 
-> **Ship Phase 1 (mobile voice loop with real barge-in) before anything else. Then persistence, then memory, then tools. Multi-speaker, identity, and vision are separate hard problems — pursue them only after the personal assistant is reliable and useful on your phone every day.**
+> **Phases 0–4 are shipped: the personal voice assistant works daily (earphones). Active goal — Phase 6: the same quality on loudspeaker, hands-free (software AEC, ONE Gemini session, no side-STT). Multi-speaker ambient is parked and identity is future — pursue only if/when room capture becomes the goal again.**
