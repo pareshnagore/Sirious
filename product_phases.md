@@ -1100,6 +1100,18 @@ playback PCM ──────┘   (far-end reference)                   (ONE 
   profile untouched.
 - Hard duck becomes the FALLBACK, not the primary mechanism, in near-talk
   speaker use.
+- DONE 29 Aug (commit bd887ecd): capture→APM→WS wired (`aec_pipeline.dart`); render leg via
+  pre-feed `playbackTap`. Measurement mode: `_captureDucked=true` hardcoded in
+  `startSession` (self-interruption loop impossible while AEC unproven end-to-end).
+  On-device: est stable 84 ms, delayValid 100% (6500+ frames), echo reduction
+  22.1 dB peak / 9.8 dB sustained (gated metric). Stage A KILL-SWITCH PASSED.
+  Stage B remaining: (1) un-duck → verify NO ghost turns with capture open on
+  speaker (the end-to-end proof), (2) re-measure reduction at 2-3 MEDIA volume
+  levels — suppression is level-dependent (low volume: echo sinks toward noise
+  floor; max volume: speaker distortion breaks the linear model; delay est is
+  NOT volume-sensitive), (3) barge-in onset threshold must be set against
+  post-AEC residual at typical volume, (4) re-init AEC on audio-route change
+  (speaker↔BT↔earphone shifts the delay model).
 
 **Stage C — speaker-mode session UX**
 - Mic stays open during answers; verify true barge-in mid-answer on loudspeaker.
