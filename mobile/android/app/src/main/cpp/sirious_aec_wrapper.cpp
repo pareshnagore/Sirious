@@ -102,4 +102,17 @@ int sirious_aec_delay_valid(void* handle) {
   return stats.delay_ms.has_value() ? 1 : 0;
 }
 
+// Returns the AEC's current delay estimate in ms, or -1 when none.
+// This is the value (not just validity) — a wildly wrong value explains
+// failed cancellation even when delay_valid reports 1.
+int sirious_aec_delay_estimate(void* handle) {
+  auto* h = static_cast<AecHandle*>(handle);
+  if (!h || !h->apm) {
+    return -1;
+  }
+  std::lock_guard<std::mutex> lock(h->mutex);
+  auto stats = h->apm->GetStatistics(/*has_remote_tracks=*/true);
+  return stats.delay_ms.has_value() ? *stats.delay_ms : -1;
+}
+
 }  // extern "C"

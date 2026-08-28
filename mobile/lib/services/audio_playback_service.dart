@@ -35,6 +35,10 @@ class AudioPlaybackService {
   /// native player.
   int get queueLength => _queue.length;
 
+  /// Phase 6 Stage A: tap fired immediately before each chunk goes to the
+  /// native player (AEC far-end reference). Set by the session controller.
+  void Function(Uint8List chunk)? playbackTap;
+
   Future<void> init() async {
     if (_initialized) {
       return;
@@ -75,6 +79,12 @@ class AudioPlaybackService {
     try {
       while (_queue.isNotEmpty && !_flushing) {
         final chunk = _queue.removeFirst();
+
+        // Phase 6 Stage A: render reference is fed HERE — immediately before
+        // the native feed, not at enqueue time — so the AEC's far-end
+        // timeline matches actual playout as closely as possible (the queue
+        // can add 0.5-2s of jitter that breaks AEC3's delay search).
+        playbackTap?.call(chunk);
 
         try {
           await FlutterPcmSound.feed(

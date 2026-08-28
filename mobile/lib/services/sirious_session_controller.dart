@@ -8,6 +8,7 @@ import 'package:path_provider/path_provider.dart';
 import '../models/latency_metrics.dart';
 import '../models/session_phase.dart';
 import '../models/transcript_turn.dart';
+import 'aec_pipeline.dart';
 import 'audio_capture_service.dart';
 import 'audio_playback_service.dart';
 import 'websocket_client.dart';
@@ -27,6 +28,13 @@ class SiriousSessionController extends ChangeNotifier {
   late final AudioCaptureService _audioCapture;
   final AudioPlaybackService _audioPlayback = AudioPlaybackService();
   late final WebSocketClient _webSocketClient;
+
+  /// Phase 6 Stage A: software AEC (AEC3) pipeline. Render leg fed from the
+  /// playback path; capture leg filters mic audio before barge-in/WS.
+  /// Spike-only for now: if the kill-switch fires (delay never valid), the
+  /// stage-B decision is hard-duck fallback, per product_phases.md Phase 6.
+  AecPipeline? _aecPipeline;
+  AecPipeline? get aecPipeline => _aecPipeline;
 
   /// Exposed for the C2 invocation screen's auto-return (playback drain).
   AudioPlaybackService get audioPlayback => _audioPlayback;
@@ -252,8 +260,30 @@ class SiriousSessionController extends ChangeNotifier {
     latency.resetForTurn();
     _allowReconnect = true;
     _reconnectAttempts = 0;
-    _captureDucked = duckCapture;
+    // Phase 6 Stage A (measurement mode): hard-duck EVERY session while the
+    // AEC spike runs. The duck only gates the playing/responding/interrupting
+    // phases — listening-phase capture is unaffected, so the conversation
+    // flow (talk → answer plays out fully → talk again) works unchanged.
+    // This kills the echo-driven self-interruption loop by construction.
+    // Revert to `duckCapture` when Stage C re-enables speaker barge-in.
+    _captureDucked = true;
     _setPhase(SessionPhase.connecting);
+
+    // Phase 6 Stage A spike: software AEC on the speaker path.
+    try {
+      _aecPipeline ??= AecPipeline(
+        onStatsLine: (line) {
+          _pushBargeInLine(line);
+          unawaited(_logToFile(line));
+        },
+      );
+      _aecPipeline!.resetMetrics();
+      _connectAecTap();
+    } catch (error) {
+      // No native lib (or stub ABI) → run without AEC, same as pre-spike.
+      _aecPipeline = null;
+      unawaited(_logToFile('AEC init failed: $error'));
+    }
 
     try {
       await _audioPlayback.init();
@@ -316,11 +346,30 @@ class SiriousSessionController extends ChangeNotifier {
   void _onMicChunk(Uint8List chunk) {
     latency.firstMicChunkAt ??= DateTime.now();
 
+    // Phase 6 Stage A: AEC processes the mic BEFORE anything else consumes
+    // it, so barge-in onset and Gemini both see echo-cancelled audio.
+    final aec = _aecPipeline;
+    if (aec != null) {
+      final processed = aec.processCaptureChunk(chunk);
+      if (chunk.isNotEmpty && processed.isEmpty) {
+        // Sub-frame remainder buffered; nothing new to send this tick.
+        return;
+      }
+      chunk = processed;
+    }
+
     // C2 hard duck: while the assistant is answering an invocation, do NOT
     // stream mic audio (speaker echo would be transcribed back as a user
     // turn and cut the answer off). No barge-in in ducked mode — the user's
     // request already rode the invoke text; follow-ups work after
     // turn_complete (phase returns to listening and capture resumes).
+    //
+    // Phase 6 Stage A: the SAME hard-duck applies on the SPEAKER path while
+    // the AEC spike is in measurement mode — residual echo above the onset
+    // threshold was triggering barge-in → flush → restart → echo → loop
+    // (self-interruption). Ducking makes that loop impossible BY
+    // CONSTRUCTION while we measure cancellation. Barge-in on speaker
+    // returns in Stage C once AEC is proven ≥ ~15 dB sustained.
     if (_captureDucked &&
         (_phase == SessionPhase.playing ||
             _phase == SessionPhase.responding ||
@@ -383,6 +432,12 @@ class SiriousSessionController extends ChangeNotifier {
     }
 
     _audioPlayback.enqueue(chunk);
+  }
+
+  /// Wire the AEC far-end reference to the playback drain loop (pre-feed).
+  /// Called once after the pipeline is created.
+  void _connectAecTap() {
+    _audioPlayback.playbackTap = (chunk) => _aecPipeline?.feedRender(chunk);
   }
 
   Future<void> _onJsonEvent(Map<String, dynamic> event) async {
@@ -672,6 +727,8 @@ class SiriousSessionController extends ChangeNotifier {
   void dispose() {
     unawaited(_cleanupSession(endPhase: SessionPhase.idle));
     unawaited(_audioCapture.dispose());
+    _aecPipeline?.dispose();
+    _aecPipeline = null;
     super.dispose();
   }
 }
