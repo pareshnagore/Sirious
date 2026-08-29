@@ -19,7 +19,7 @@ import 'echo_canceller.dart';
 ///   - Constant delay report (100 ms). AEC3 owns jitter internally.
 class AecPipeline {
   AecPipeline({void Function(String line)? onStatsLine})
-      : _onStatsLine = onStatsLine {
+    : _onStatsLine = onStatsLine {
     _aec = EchoCanceller();
   }
 
@@ -48,11 +48,35 @@ class AecPipeline {
 
   /// Set per capture frame: does the render reference CONTAIN real audio at
   /// this instant (echo possible now)? Without this gate the reduction
-  /// window dilutes echo frames with silence frames (room tone has pre≈post
+  /// window dilutes echo frames with silence frames (room tone: pre≈post
   /// energy → ratio→1 → ~0 dB even when cancellation is excellent).
   bool _refAudioThisFrame = false;
 
+  // ── Stage B: residual tracking (barge-in threshold basis) ────────────────
+  // Residual = post-AEC capture energy on frames whose render reference
+  // carries audio — i.e. what echo LEAKS through at the current volume.
+  // Suppression dB is level-dependent (low volume → echo sinks toward the
+  // noise floor; max volume → distortion breaks the linear model), so the
+  // barge-in onset threshold must be set against THIS, not a fixed value.
+  static const int _residualWindow = 100; // ~1s of 10 ms frames
+  final List<double> _residualRms = <double>[];
+  double _residualFloor = 0;
+
+  /// Post-AEC residual RMS floor over the last ~1s of echo-carrying frames
+  /// (0 when the far end is idle). Feeds the controller's onset threshold.
+  double get residualFloor => _residualFloor;
+
   static const int _constantDelayMs = 100;
+
+  /// Last instant the render reference carried real audio (echo possible).
+  DateTime _lastRefAudioAt = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// True when playback is in flight or just ended (~tail window) — i.e.
+  /// mic audio right now may contain echo. Feeds the controller's
+  /// sustained-voice gate (echo bursts are transients; real speech sustains).
+  bool get farEndRecently =>
+      DateTime.now().difference(_lastRefAudioAt) <
+      const Duration(milliseconds: 400);
 
   double get echoReductionDb {
     if (_metricFrames == 0) {
@@ -80,6 +104,7 @@ class AecPipeline {
       return;
     }
     _farEndActive = true;
+    _lastRefAudioAt = DateTime.now();
 
     const frameBytes = 480; // 240 samples * 2
     final buf = Uint8List.fromList(pcm);
@@ -110,8 +135,9 @@ class AecPipeline {
     }
 
     final wholeFrames = _captureBuf.length ~/ frameBytes;
-    final bytes =
-        Uint8List.fromList(_captureBuf.sublist(0, wholeFrames * frameBytes));
+    final bytes = Uint8List.fromList(
+      _captureBuf.sublist(0, wholeFrames * frameBytes),
+    );
     final out = BytesBuilder(copy: false);
     final inFrame = Int16List(160);
     final outFrame = Int16List(160);
@@ -144,6 +170,17 @@ class AecPipeline {
         if (_aec.delayValid()) {
           _delayValidFrames++;
         }
+
+        // Stage B: residual echo floor for the barge-in threshold. Track the
+        // running post-AEC RMS on echo-carrying frames; the FLOOR (25th
+        // percentile) rather than the mean — a user starting to talk mid-
+        // answer is exactly what we must NOT fold into the residual.
+        final rms = math.sqrt(post / 160);
+        _residualRms.add(rms);
+        if (_residualRms.length > _residualWindow) {
+          _residualRms.removeAt(0);
+        }
+        _residualFloor = _percentile(_residualRms, 0.25);
       }
 
       final obd = ByteData(frameBytes);
@@ -179,6 +216,16 @@ class AecPipeline {
     return true;
   }
 
+  /// p in [0,1]; nearest-rank-ish over a copy (window is tiny, ~100 items).
+  static double _percentile(List<double> values, double p) {
+    if (values.isEmpty) {
+      return 0;
+    }
+    final sorted = List<double>.of(values)..sort();
+    final idx = ((sorted.length - 1) * p).round().clamp(0, sorted.length - 1);
+    return sorted[idx];
+  }
+
   void _maybeEmitStats() {
     if (_onStatsLine == null || _metricFrames < 20) {
       return;
@@ -190,6 +237,7 @@ class AecPipeline {
     _lastStatsAt = now;
     _onStatsLine(
       'AEC reduction=${echoReductionDb.toStringAsFixed(1)}dB '
+      'res=${_residualFloor.toStringAsFixed(0)} '
       'delayValid=${(delayValidRatio * 100).toStringAsFixed(0)}% '
       'est=${_aec.delayEstimateMs()}ms '
       'frames=$_metricFrames',

@@ -16,9 +16,15 @@ import '../config/app_config.dart';
 ///   session's audio while JSON events keep flowing).
 /// - [enqueue]— buffers PCM and kicks the drain loop by feeding directly, so
 ///   we never depend on the plugin's fragile `_needsStart`-gated `start()`.
-/// - [flush]  — barge-in / session end: drop pending audio and hard-stop the
-///   native player (release + re-init). Safe to call repeatedly.
-/// - [dispose]— app teardown only.
+/// - [flush]  — barge-in / session end: drop pending audio and stop feeding.
+///   SOFT by design (Phase 6 Stage B): the native track is NOT released —
+///   releasing + re-setting up on every barge-in changed the playout path
+///   latency (AEC delay est 84→300 ms measured 30 Aug) and permanently broke
+///   the AEC3 echo model for the rest of the session (21.3→2.9 dB), which
+///   resurrected the self-echo loop. The native buffer only holds ~100 ms,
+///   so stopping the feed silences the speaker in ≤0.2 s with the audio
+///   track (and the AEC's view of it) untouched.
+/// - [dispose]— app teardown only (the ONLY place the track is released).
 class AudioPlaybackService {
   final Queue<Uint8List> _queue = Queue<Uint8List>();
   bool _initialized = false;
@@ -109,10 +115,12 @@ class AudioPlaybackService {
     await _drain();
   }
 
-  /// Hard stop: drop queued audio and reset the native player.
-  /// Used on barge-in (`interrupted`) and at session end.
-  /// Returns the wall-clock time when the speaker has actually gone silent
-  /// (after the native player is released), null if not initialized.
+  /// Soft stop: drop queued audio and STOP FEEDING, but do NOT release the
+  /// native player (see the class doc — releasing on barge-in broke the AEC
+  /// delay model for the rest of the session). The native feed buffer holds
+  /// only ~100 ms after the last feed, so the speaker goes silent quickly.
+  /// Returns the wall-clock time the flush ran — an upper bound on when the
+  /// speaker actually goes silent (≤~200 ms later, buffer drain).
   Future<DateTime?> flush() async {
     if (!_initialized) {
       return null;
@@ -120,19 +128,12 @@ class AudioPlaybackService {
 
     _flushing = true;
     _queue.clear();
+    // Let an in-flight _drain() observe _flushing and bail before its next
+    // feed — at most one extra chunk (~10-40 ms) plays past this point.
+    await Future<void>.delayed(Duration.zero);
 
-    DateTime? stopTime;
-    try {
-      await FlutterPcmSound.release();
-      // The speaker is silent the instant the native engine is released.
-      // Timestamp it HERE — the re-setup below is extra latency, not silence.
-      stopTime = DateTime.now();
-      await _setupOutput();
-      await FlutterPcmSound.setFeedThreshold(AppConfig.outputSampleRate ~/ 10);
-    } finally {
-      _flushing = false;
-    }
-
+    final stopTime = DateTime.now();
+    _flushing = false;
     return stopTime;
   }
 

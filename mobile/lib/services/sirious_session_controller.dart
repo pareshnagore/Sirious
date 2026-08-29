@@ -11,6 +11,8 @@ import '../models/transcript_turn.dart';
 import 'aec_pipeline.dart';
 import 'audio_capture_service.dart';
 import 'audio_playback_service.dart';
+import 'audio_route_watcher.dart';
+import 'ghost_echo_detector.dart';
 import 'websocket_client.dart';
 
 /// Orchestrates WebSocket, mic capture, playback, and UI state.
@@ -22,6 +24,9 @@ class SiriousSessionController extends ChangeNotifier {
       onBinaryData: _onBinaryData,
       onDone: _onSocketDone,
       onError: _onSocketError,
+    );
+    _routeSub = AudioRouteWatcher.instance.routeChanges.listen(
+      (_) => _onAudioRouteChanged(),
     );
   }
 
@@ -87,6 +92,20 @@ class SiriousSessionController extends ChangeNotifier {
   /// by design (ducking ladder step 1, no exceptions).
   bool _captureDucked = false;
 
+  /// Caller's duck preference for THIS session (base state the adaptive
+  /// per-turn duck restores to at turn boundaries).
+  bool _captureDuckedBase = false;
+
+  // ── Stage B (B4): route-change AEC re-init ───────────────────────────────
+  // Speaker ↔ BT ↔ earphone shifts the acoustic echo path (delay + impulse
+  // response). AEC3 adapts eventually, but re-creating the pipeline gives a
+  // clean estimator immediately. Only rebuilt while a session is live; the
+  // subscription lives for the controller's lifetime.
+  StreamSubscription<void>? _routeSub;
+  static const int _routeReinitCooldownMs = 3000;
+  DateTime _lastRouteReinitAt = DateTime.fromMillisecondsSinceEpoch(0);
+  int _routeReinitCount = 0;
+
   /// Backoff delay for the Nth retry (1s, 2s, 4s, … capped at 8s).
   Duration _reconnectDelay() {
     final exp = math.min(_reconnectAttempts, 3); // 2^3 = 8s cap
@@ -108,10 +127,45 @@ class SiriousSessionController extends ChangeNotifier {
   static const double _onsetRiseFactor = 4.0;
   static const int _noiseWindowChunks = 20; // ~2s at 100ms chunks
 
+  /// Stage B (B3): residual-echo margin. While the far end plays, leaked echo
+  /// raises the post-AEC mic level; the onset threshold must clear THAT floor
+  /// (per-volume, from the AEC pipeline) or residual echo reads as barge-in.
+  /// ×8 so the gate actually binds: measured residual floors 9-68 → threshold
+  /// 72-544, exceeding the absolute floor from res≈32 up (log 30 Aug showed
+  /// ×2.5 NEVER bound — thr was pinned at the 250 hard floor all session).
+  static const double _residualRiseFactor = 8.0;
+
+  /// Onset hard floor DURING PLAYBACK: the mic then carries echo on top of
+  /// room tone, and echo energy bursts measured 266-521 RMS (30 Aug log) —
+  /// right at the 250 listening-phase floor. Real speech at speaker distance
+  /// measured 1000-6300. 450 separates them without touching listening-phase
+  /// sensitivity (barging in during playback is the only case this guards).
+  static const double _onsetPlaybackHardFloor = 450.0;
+
+  /// Stage B (B3): voice-like recency window. The ghost gate accepts Gemini's
+  /// `interrupted` / transcript-during-playback only if a client-side voice
+  /// onset fired within this window before the server event — residual echo
+  /// does NOT look like speech to the onset detector, so this is the
+  /// evidence distinguishing a real user from leaked echo.
+  static const int _onsetRecencyMs = 2000;
+
   final List<double> _recentRms = <double>[];
   double _onsetNoiseFloor = 0;
   double _windowPeakRms = 0; // loudest chunk in the CURRENT playback window
   bool _interruptionHandled = false; // true once this turn's barge-in ran
+  DateTime? _lastVoiceLikeAt; // last onset crossing while playing/responding
+  bool _wasLoud = false; // previous chunk crossed threshold (sustain gate)
+
+  // ── Stage B: lexical ghost-echo detector ──────────────────────────────────
+  // AEC residual at conversational volume stays intelligible enough that
+  // Gemini transcribes the assistant's OWN words back as user turns (seen
+  // live 29 Aug: "What can I help", "Just let me know" as You-turns). Energy
+  // gating cannot separate speech-echo from speech — but CONTENT can: the
+  // echo is a delayed copy of what we just played. Unit-tested against the
+  // real ghost strings from that session (ghost_echo_detector_test.dart);
+  // known misses (transcription variance like "Alright"→"All right") fall
+  // through to the per-turn adaptive-duck backstop in _handleInterruption.
+  final GhostEchoDetector _ghostDetector = GhostEchoDetector();
 
   double _rms(Uint8List pcm) {
     final sampleCount = pcm.length ~/ 2;
@@ -127,22 +181,30 @@ class SiriousSessionController extends ChangeNotifier {
     return math.sqrt(sumSq / sampleCount);
   }
 
-  /// Durable, pullable log on the device (read via `adb shell run-as
-  /// com.sirious.sirious cat files/app_flutter/sirious_bargein.log` for a
-  /// debug build). The on-screen summary only shows the LAST measurement
-  /// briefly, which is unreliable to capture — this file is the source of
-  /// truth for barge-in. `getApplicationDocumentsDirectory()` is the canonical
-  /// writable app dir (Directory.systemTemp is not writable on Android).
+  /// Durable log. Dual-writes BOTH directories:
+  ///   - app documents (private): historical channel
+  ///   - external files dir: adb-pullable on RELEASE builds
+  ///     (`adb pull /storage/emulated/0/Android/data/com.sirious.sirious/files/`)
+  ///     — run-as is blocked on release, so this is the debug lifeline.
+  /// `getApplicationDocumentsDirectory()` is the canonical writable app dir
+  /// (Directory.systemTemp is not writable on Android).
   Future<void> _logToFile(String message) async {
+    final line = '${DateTime.now().toIso8601String()} $message\n';
     try {
       final dir = await getApplicationDocumentsDirectory();
       final file = File('${dir.path}/sirious_bargein.log');
-      await file.writeAsString(
-        '${DateTime.now().toIso8601String()} $message\n',
-        mode: FileMode.append,
-      );
+      await file.writeAsString(line, mode: FileMode.append);
     } catch (e) {
       debugPrint('bargein log write failed: $e');
+    }
+    try {
+      final ext = await getExternalStorageDirectories();
+      if (ext != null && ext.isNotEmpty) {
+        final file = File('${ext.first.path}/sirious_bargein.log');
+        await file.writeAsString(line, mode: FileMode.append);
+      }
+    } catch (_) {
+      // External storage unavailable (rare) — documents copy still holds.
     }
   }
 
@@ -203,7 +265,9 @@ class SiriousSessionController extends ChangeNotifier {
 
   void _pushBargeInLine(String line) {
     _bargeInLog.insert(0, line);
-    if (_bargeInLog.length > 12) {
+    // 100 lines: deep enough to cover a full multi-test session without
+    // wrapping off the evidence (was 12 — screenshots kept losing context).
+    if (_bargeInLog.length > 100) {
       _bargeInLog.removeLast();
     }
   }
@@ -211,8 +275,39 @@ class SiriousSessionController extends ChangeNotifier {
   /// Single code path for a barge-in, triggered either by Gemini's explicit
   /// `interrupted` event OR by a `user_transcript` arriving during playback.
   /// Runs at most once per turn (guarded by [_interruptionHandled]).
+  ///
+  /// Stage B (B3) GHOST GATE: with capture open during playback, leaked echo
+  /// can still trip Gemini's VAD server-side even after AEC. A REAL user
+  /// produces client-side voice-like energy (onset threshold crossed) shortly
+  /// before the server event; residual echo does not. So an interruption
+  /// signal with no voice-like onset in the last [_onsetRecencyMs] is treated
+  /// as a ghost: logged, playback kept, turn NOT cut.
   Future<void> _handleInterruption(DateTime receivedAt) async {
     if (_interruptionHandled) {
+      return;
+    }
+    final lastVoice = _lastVoiceLikeAt;
+    final voiceRecent =
+        lastVoice != null &&
+        receivedAt.difference(lastVoice).inMilliseconds <= _onsetRecencyMs;
+    if (!voiceRecent) {
+      unawaited(
+        _logToFile(
+          'GHOST_REJECT ${_clock(receivedAt)} '
+          'res=${(_aecPipeline?.residualFloor ?? 0).toStringAsFixed(0)} '
+          'lastVoice=${lastVoice == null ? 'never' : _clock(lastVoice)} '
+          '→ duck rest of turn',
+        ),
+      );
+      _pushBargeInLine(
+        '${_clock(receivedAt)} · ghost rejected — ducking rest of turn',
+      );
+      // Echo is reaching Gemini's VAD with no local voice evidence. Duck the
+      // REST of this turn (Stage A behavior) so the flush→echo→loop cannot
+      // sustain itself; _endOnsetWindow() at the next turn boundary restores
+      // the caller's base duck state. A real user mid-duck rides the same
+      // path as table mode: their turn lands after turn_complete.
+      _captureDucked = true;
       return;
     }
     _interruptionHandled = true;
@@ -260,13 +355,13 @@ class SiriousSessionController extends ChangeNotifier {
     latency.resetForTurn();
     _allowReconnect = true;
     _reconnectAttempts = 0;
-    // Phase 6 Stage A (measurement mode): hard-duck EVERY session while the
-    // AEC spike runs. The duck only gates the playing/responding/interrupting
-    // phases — listening-phase capture is unaffected, so the conversation
-    // flow (talk → answer plays out fully → talk again) works unchanged.
-    // This kills the echo-driven self-interruption loop by construction.
-    // Revert to `duckCapture` when Stage C re-enables speaker barge-in.
-    _captureDucked = true;
+    // Stage B (B1): ducking is caller-controlled again. Stage A's hardcoded
+    // `true` is gone — AEC3 is proven on-device (kill-switch passed), so
+    // capture stays OPEN during playback on the speaker path and the
+    // residual-based ghost gate (below) guards against echo-driven
+    // self-interruption instead of ducking by construction.
+    _captureDucked = duckCapture;
+    _captureDuckedBase = duckCapture;
     _setPhase(SessionPhase.connecting);
 
     // Phase 6 Stage A spike: software AEC on the speaker path.
@@ -364,12 +459,11 @@ class SiriousSessionController extends ChangeNotifier {
     // request already rode the invoke text; follow-ups work after
     // turn_complete (phase returns to listening and capture resumes).
     //
-    // Phase 6 Stage A: the SAME hard-duck applies on the SPEAKER path while
-    // the AEC spike is in measurement mode — residual echo above the onset
-    // threshold was triggering barge-in → flush → restart → echo → loop
-    // (self-interruption). Ducking makes that loop impossible BY
-    // CONSTRUCTION while we measure cancellation. Barge-in on speaker
-    // returns in Stage C once AEC is proven ≥ ~15 dB sustained.
+    // Phase 6 Stage B: the duck now applies ONLY to table/ambient invocation
+    // (duckCapture: true). On the speaker path capture stays OPEN during
+    // playback — AEC3 cleans the echo, the residual-aware onset threshold
+    // refuses echo-level energy, and the ghost gate rejects server-side
+    // interruption signals with no local voice evidence.
     if (_captureDucked &&
         (_phase == SessionPhase.playing ||
             _phase == SessionPhase.responding ||
@@ -404,19 +498,57 @@ class SiriousSessionController extends ChangeNotifier {
       _onsetNoiseFloor = floor.isFinite ? floor : _onsetHardFloor;
       latency.lastBargeInNoiseFloor = _onsetNoiseFloor;
 
+      // Stage B (B3): while Sirious plays, the threshold must also clear the
+      // residual echo floor at the current volume (measured post-AEC by the
+      // pipeline, ~1s window) and a higher hard floor (echo bursts measured
+      // 266-521 RMS while real speech at speaker distance is 1000+). In
+      // listening phase residual is 0 and the normal floor applies.
+      final residual = _aecPipeline?.residualFloor ?? 0;
+      final hardFloor = _onsetPlaybackHardFloor;
       final threshold = math.max(
-        _onsetNoiseFloor * _onsetRiseFactor,
-        _onsetHardFloor,
+        math.max(
+          _onsetNoiseFloor * _onsetRiseFactor,
+          residual * _residualRiseFactor,
+        ),
+        hardFloor,
       );
-      if (latency.bargeInOnsetAt == null && rms > threshold) {
-        latency.bargeInOnsetAt = DateTime.now();
-        unawaited(
-          _logToFile(
-            'ONSET rms=${rms.toStringAsFixed(0)} '
-            'thr=${threshold.toStringAsFixed(0)} floor=${_onsetNoiseFloor.toStringAsFixed(0)}',
-          ),
-        );
+
+      // Sustained-voice gate (Stage B, log-driven 30 Aug): post-AEC echo
+      // arrives in TRANSIENTS — per-chunk RMS 3677-7033 while the residual
+      // floor sits at 11 (75%+ of echo chunks are near-silence) — and a
+      // single loud burst used to count as "voice evidence". Real speech
+      // sustains. So while the far end is active (or in its ~400 ms tail),
+      // a chunk only counts as voice if the ENERGY ALSO HELD last chunk —
+      // i.e. two consecutive loud chunks ≈ 200 ms of continuous voice.
+      // First-burst echo now fails the gate; Gemini-side echoes never get
+      // "voice evidence", and the burst itself still streams (harmless
+      // residual noise for the server VAD, cleaned by the lexical filter).
+      final sustained = aec == null || !aec.farEndRecently || _wasLoud;
+      if (rms > threshold) {
+        if (sustained) {
+          if (latency.bargeInOnsetAt == null) {
+            latency.bargeInOnsetAt = DateTime.now();
+            unawaited(
+              _logToFile(
+                'ONSET rms=${rms.toStringAsFixed(0)} '
+                'thr=${threshold.toStringAsFixed(0)} floor=${_onsetNoiseFloor.toStringAsFixed(0)} '
+                'res=${residual.toStringAsFixed(0)} sustained=true',
+              ),
+            );
+          }
+          // Voice-like energy just happened — feeds the ghost gate.
+          _lastVoiceLikeAt = DateTime.now();
+        } else {
+          unawaited(
+            _logToFile(
+              'BURST_SKIP rms=${rms.toStringAsFixed(0)} '
+              'thr=${threshold.toStringAsFixed(0)} res=${residual.toStringAsFixed(0)} '
+              '(transient during playback — not voice)',
+            ),
+          );
+        }
       }
+      _wasLoud = rms > threshold;
     }
 
     if (_webSocketClient.isConnected) {
@@ -438,6 +570,48 @@ class SiriousSessionController extends ChangeNotifier {
   /// Called once after the pipeline is created.
   void _connectAecTap() {
     _audioPlayback.playbackTap = (chunk) => _aecPipeline?.feedRender(chunk);
+  }
+
+  /// Stage B (B4): the audio output route changed → rebuild the AEC pipeline
+  /// so the delay estimator re-locks on the new echo path instead of grinding
+  /// through a re-adaptation transient (or diverging on a big delay jump).
+  void _onAudioRouteChanged() {
+    if (_phase != SessionPhase.playing &&
+        _phase != SessionPhase.responding &&
+        _phase != SessionPhase.listening &&
+        _phase != SessionPhase.interrupting) {
+      return; // no live session → next startSession() builds fresh anyway
+    }
+    final now = DateTime.now();
+    if (now.difference(_lastRouteReinitAt).inMilliseconds <
+        _routeReinitCooldownMs) {
+      return; // coalesce duplicate native callbacks
+    }
+    _lastRouteReinitAt = now;
+    _routeReinitCount++;
+
+    try {
+      _aecPipeline?.dispose();
+    } catch (_) {}
+    try {
+      _aecPipeline = AecPipeline(
+        onStatsLine: (line) {
+          _pushBargeInLine(line);
+          unawaited(_logToFile(line));
+        },
+      );
+      _connectAecTap();
+      final line =
+          'ROUTE re-init #$_routeReinitCount — AEC rebuilt for new output route';
+      _pushBargeInLine(line);
+      unawaited(_logToFile(line));
+    } catch (error) {
+      // Route change hit while the native lib is unavailable — drop the AEC
+      // leg and keep the session alive (same policy as init failure).
+      _aecPipeline = null;
+      unawaited(_logToFile('AEC route re-init failed: $error'));
+    }
+    notifyListeners();
   }
 
   Future<void> _onJsonEvent(Map<String, dynamic> event) async {
@@ -479,11 +653,48 @@ class SiriousSessionController extends ChangeNotifier {
           break;
         }
 
+        // Post-turn echo guard: the assistant's own tail can keep arriving
+        // through the AEC residual for a moment AFTER playback ends. A
+        // "user" transcript that repeats just-spoken assistant words within
+        // the guard window is echo — do not open a user turn with it.
+        if (_phase == SessionPhase.listening &&
+            _ghostDetector.isWithinPostTurnGuard &&
+            _ghostDetector.isEcho(text)) {
+          unawaited(
+            _logToFile(
+              'GHOST_LEXICAL ${_clock(DateTime.now())} post-turn '
+              '"${text.length > 40 ? '${text.substring(0, 40)}…' : text}" → dropped',
+            ),
+          );
+          _pushBargeInLine('ghost echo rejected (post-turn): "$text"');
+          break;
+        }
+
         latency.firstUserTranscriptAt ??= DateTime.now();
         _currentTurnStartedAt ??= DateTime.now();
         _currentUserText += text;
 
         if (_phase == SessionPhase.playing) {
+          // User is talking while Sirious is playing — that is a barge-in…
+          // UNLESS the "user" text is the assistant's own echo. Lexical
+          // ghost check BEFORE any flush: energy gates cannot separate
+          // speech-echo from speech (echo IS speech), content can.
+          if (_ghostDetector.isEcho(text)) {
+            unawaited(
+              _logToFile(
+                'GHOST_LEXICAL ${_clock(DateTime.now())} '
+                '"${text.length > 40 ? '${text.substring(0, 40)}…' : text}" '
+                'matches recent assistant words → dropped',
+              ),
+            );
+            _pushBargeInLine('ghost echo rejected: "$text"');
+            // The energy crossing that just happened was echo, not voice —
+            // cancel it so a trailing `interrupted` event finds no voice
+            // evidence and is ghost-rejected (with per-turn duck) too.
+            _lastVoiceLikeAt = null;
+            latency.bargeInOnsetAt = null;
+            break;
+          }
           // User is talking while Sirious is playing — that is a barge-in.
           // Flush + measure immediately; don't wait for a separate
           // `interrupted` event (Gemini may not always emit one).
@@ -504,6 +715,7 @@ class SiriousSessionController extends ChangeNotifier {
         latency.firstAssistantTranscriptAt ??= DateTime.now();
         _currentTurnStartedAt ??= DateTime.now();
         _currentAssistantText += text;
+        _ghostDetector.trackAssistant(text);
 
         if (_phase == SessionPhase.listening ||
             _phase == SessionPhase.responding) {
@@ -528,6 +740,7 @@ class SiriousSessionController extends ChangeNotifier {
         _commitCurrentTurn(interrupted: false);
         _setPhase(SessionPhase.listening);
         latency.resetForTurn();
+        _ghostDetector.markTurnComplete();
         break;
 
       case 'session_warning':
@@ -684,7 +897,12 @@ class SiriousSessionController extends ChangeNotifier {
     _recentRms.clear();
     _onsetNoiseFloor = 0;
     _windowPeakRms = 0;
+    _lastVoiceLikeAt = null; // ghost gate: stale voice evidence must not count
+    _wasLoud = false; // sustain gate: a stale "was loud" must not carry over
     _interruptionHandled = false;
+    // Adaptive duck (Stage B ghost-gate fallback): restore the caller's base
+    // state — a ghost-triggered per-turn duck never survives the turn boundary.
+    _captureDucked = _captureDuckedBase;
   }
 
   void _commitCurrentTurn({required bool interrupted}) {
@@ -725,6 +943,7 @@ class SiriousSessionController extends ChangeNotifier {
 
   @override
   void dispose() {
+    unawaited(_routeSub?.cancel());
     unawaited(_cleanupSession(endPhase: SessionPhase.idle));
     unawaited(_audioCapture.dispose());
     _aecPipeline?.dispose();
