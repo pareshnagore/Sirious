@@ -1,6 +1,6 @@
 import 'dart:async';
-import 'dart:typed_data';
 
+import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
@@ -8,14 +8,23 @@ import '../config/app_config.dart';
 
 typedef AudioChunkHandler = void Function(Uint8List chunk);
 
-/// Capture tuning per session mode (Phase 5).
+/// Capture tuning per session mode (Phase 5/6).
 ///
 /// - nearTalk: the 1:1 voice-loop profile — full NS/AGC for close speech.
 /// - farField: ambient/table profile. NS is relaxed so distant voices are
 ///   not attenuated; AGC is a no-op on SM-E346B (effect unavailable, probed
-///   25 Aug) but declared false to match intent. Source stays MIC — the
-///   voiceCommunication experiment was decisively rejected on this device.
-enum CaptureProfile { nearTalk, farField }
+///   25 Aug) but declared false to match intent.
+/// - speaker (Phase 6, 30 Aug): PLATFORM AEC path — the configuration the
+///   vendor apps (ChatGPT/Perplexity) drive. VOICE_COMMUNICATION source +
+///   MODE_IN_COMMUNICATION routes capture through Android's
+///   AcousticEchoCanceler WITH a real far-end reference (our playback),
+///   giving working full-duplex echo cancellation on SM-E346B/Android 16
+///   (probe 30 Aug: far-end tone suppressed to p50≈50 RMS, near-end voice
+///   passes during playback at peak 63–120 vs baseline 2–4; legacy
+///   MODE_NORMAL+speakerphone path is half-duplex and kills near-end voice).
+///   The 25 Aug "call pipeline mutes the mic" verdict tested only the legacy
+///   path and misread platform-AEC residual as mute.
+enum CaptureProfile { nearTalk, farField, speaker }
 
 /// Captures microphone PCM at 16 kHz mono for protocol v1.
 class AudioCaptureService {
@@ -23,6 +32,8 @@ class AudioCaptureService {
 
   final AudioChunkHandler onChunk;
   final AudioRecorder _recorder = AudioRecorder();
+
+  static const MethodChannel _channel = MethodChannel('sirious/audio_route');
 
   StreamSubscription<Uint8List>? _subscription;
 
@@ -40,6 +51,17 @@ class AudioCaptureService {
     }
 
     final farField = profile == CaptureProfile.farField;
+    final speakerPlatform = profile == CaptureProfile.speaker;
+
+    if (speakerPlatform) {
+      // Modern communication-device routing (belt & suspenders on top of
+      // record's speakerphone flag — the same API the vendor apps drive).
+      try {
+        await _channel.invokeMethod('set_speaker_comm_device');
+      } catch (_) {
+        // Channel missing / pre-API-31: record's speakerphone flag covers it.
+      }
+    }
 
     final stream = await _recorder.startStream(
       RecordConfig(
@@ -47,26 +69,28 @@ class AudioCaptureService {
         sampleRate: AppConfig.inputSampleRate,
         numChannels: AppConfig.inputChannels,
         // Near-talk (1:1): on-device AEC/NS so the mic does not feed
-        // Sirious's own playout back to the server. Without this, earpiece/
-        // speaker audio bleeds into the capture, which causes audible echo
-        // AND confuses Gemini's barge-in detection.
+        // Sirious's own playout back to the server.
         //
         // Far-field (ambient): NS relaxed — aggressive suppression tuned for
-        // near speech attenuates table-distance voices, hurting exactly the
-        // far-field capture diarization needs. Nothing plays out in ambient
-        // mode, so there is no echo to cancel.
+        // near speech attenuates table-distance voices. Nothing plays out in
+        // ambient mode, so there is no echo to cancel.
+        //
+        // Speaker platform (Phase 6): the PLATFORM AEC removes the echo
+        // (voiceCommunication source + InCommunication mode routes the
+        // capture through AcousticEchoCanceler with our playout as the
+        // far-end reference — probed working 30 Aug). The echoCancel flag
+        // is irrelevant here: the platform attaches AEC for
+        // VOICE_COMMUNICATION unconditionally.
         echoCancel: !farField,
         noiseSuppress: !farField,
         autoGain: !farField,
-        // NOTE (25 Aug echo experiment, REVERTED): voiceCommunication source +
-        // MODE_IN_COMMUNICATION + speakerphone was tested for full-duplex
-        // speaker use. Result on SM-E346B: uplink delivers DIGITAL SILENCE
-        // during playback (barge-in onset peak/floor = 0, "onset missed") and
-        // echo still leaked through playback gaps as ghost user turns.
-        // Samsung's call pipeline hard-gates the mic during far-end audio.
-        // Conclusion: full-duplex via call pipeline is a dead end on this
-        // device — ducking (suppress capture while Sirious speaks) is the
-        // only viable answer-time strategy. See sirious-build skill.
+        androidConfig: speakerPlatform
+            ? const AndroidRecordConfig(
+                audioSource: AndroidAudioSource.voiceCommunication,
+                audioManagerMode: AudioManagerMode.modeInCommunication,
+                speakerphone: true,
+              )
+            : const AndroidRecordConfig(),
       ),
     );
 

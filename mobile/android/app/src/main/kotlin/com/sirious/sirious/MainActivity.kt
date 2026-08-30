@@ -5,19 +5,22 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.os.Handler
 import android.os.Looper
+import io.flutter.plugin.common.EventChannel
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
 
 /**
- * Phase 6 Stage B (B4): reports audio-route (output device) changes to Dart.
+ * Audio-route plumbing for Phase 6 speaker mode.
  *
- * A route change (speaker <-> BT <-> earphone) shifts the acoustic echo path,
- * so the AEC3 delay model must be rebuilt (fresh AecPipeline) - see
- * sirious_session_controller._onAudioRouteChanged().
- *
- * Debounced on the native side: some devices fire several callbacks for one
- * physical change; 500 ms coalesces them.
+ * - `set_speaker_comm_device` (MethodChannel): routes playback/capture through
+ *   the MODERN communication-device API (AudioManager.setCommunicationDevice)
+ *   — the same path ChatGPT/Perplexity drive. Combined with a
+ *   VOICE_COMMUNICATION capture source this gives full-duplex platform AEC
+ *   on SM-E346B/Android 16 (probe-verified 30 Aug).
+ * - `sirious/audio_route` EventChannel: emits "route_changed" on output-device
+ *   changes (speaker <-> BT <-> earphone), debounced 500 ms natively. The Dart
+ *   side rebuilds the (dormant) software-AEC pipeline on route changes.
  */
 class MainActivity : FlutterActivity() {
 
@@ -46,6 +49,27 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            METHOD_CHANNEL,
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "set_speaker_comm_device" -> {
+                    try {
+                        val am = getSystemService(AudioManager::class.java)
+                        val speaker = am.availableCommunicationDevices
+                            .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                        val ok = speaker != null && am.setCommunicationDevice(speaker)
+                        result.success(if (ok) "ok" else "failed")
+                    } catch (e: Exception) {
+                        result.error("comm_device", e.message, null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         EventChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             ROUTE_CHANNEL,
@@ -64,18 +88,19 @@ class MainActivity : FlutterActivity() {
         })
     }
 
+
     override fun onDestroy() {
         try {
             getSystemService(AudioManager::class.java)
                 .unregisterAudioDeviceCallback(deviceCallback)
         } catch (_: Exception) {
-            // Already unregistered (onCancel) or engine torn down.
         }
         super.onDestroy()
     }
 
     companion object {
-        private const val ROUTE_CHANNEL = "sirious/audio_route"
+        private const val METHOD_CHANNEL = "sirious/audio_route"
+        private const val ROUTE_CHANNEL = "sirious/audio_route_events"
         private const val ROUTE_DEBOUNCE_MS = 500L
     }
 }

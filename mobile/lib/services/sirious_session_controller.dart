@@ -123,24 +123,25 @@ class SiriousSessionController extends ChangeNotifier {
   /// Onset fires when: rms > max(noiseFloor * riseFactor, hardFloor).
   /// Speck chunks far above silence are excluded from the floor so speech
   /// never inflates the baseline (which would suppress detection).
-  static const double _onsetHardFloor = 250.0;
+  /// RECALIBRATED 30 Aug for PLATFORM AEC capture (voiceCommunication +
+  /// InCommunication): probe showed room tone ~2-7, real near speech 63-120+
+  /// (vs the old RAW mic's 1000-8000). 60 keeps the same speech/noise ratio
+  /// the old 250 had against the raw mic.
+  static const double _onsetHardFloor = 60.0;
   static const double _onsetRiseFactor = 4.0;
   static const int _noiseWindowChunks = 20; // ~2s at 100ms chunks
 
-  /// Stage B (B3): residual-echo margin. While the far end plays, leaked echo
-  /// raises the post-AEC mic level; the onset threshold must clear THAT floor
-  /// (per-volume, from the AEC pipeline) or residual echo reads as barge-in.
-  /// ×8 so the gate actually binds: measured residual floors 9-68 → threshold
-  /// 72-544, exceeding the absolute floor from res≈32 up (log 30 Aug showed
-  /// ×2.5 NEVER bound — thr was pinned at the 250 hard floor all session).
+  /// Stage B (B3): residual-echo margin — DORMANT with platform AEC
+  /// (residualFloor comes from the unwired software AEC pipeline = 0).
+  /// Kept for the software-AEC backup path.
   static const double _residualRiseFactor = 8.0;
 
-  /// Onset hard floor DURING PLAYBACK: the mic then carries echo on top of
-  /// room tone, and echo energy bursts measured 266-521 RMS (30 Aug log) —
-  /// right at the 250 listening-phase floor. Real speech at speaker distance
-  /// measured 1000-6300. 450 separates them without touching listening-phase
-  /// sensitivity (barging in during playback is the only case this guards).
-  static const double _onsetPlaybackHardFloor = 450.0;
+  /// Onset hard floor DURING PLAYBACK. With PLATFORM AEC (probe 30 Aug),
+  /// far-end residual sits ~50 RMS and near speech at table distance 63-120+.
+  /// The old 450 (raw-mic calibration) was deaf to real users — "barge-in
+  /// not working". 110 clears residual (~50) with margin, sits under real
+  /// speech onset at table distance.
+  static const double _onsetPlaybackHardFloor = 110.0;
 
   /// Stage B (B3): voice-like recency window. The ghost gate accepts Gemini's
   /// `interrupted` / transcript-during-playback only if a client-side voice
@@ -330,6 +331,14 @@ class SiriousSessionController extends ChangeNotifier {
     latency.resetForTurn();
   }
 
+  /// Phase 6 Stage B→C: PLATFORM AEC is the primary echo canceller on the
+  /// speaker path (probed working 30 Aug via VOICE_COMMUNICATION +
+  /// setCommunicationDevice). The software AEC3 pipeline stays in the
+  /// codebase as BACKUP (vendor-parity: ChatGPT keeps WebRTC APM behind the
+  /// platform AEC) but is UNWIRED from the capture path — metrics only, no
+  /// gating decisions depend on it. Flip `_useSoftwareAec` to re-enable.
+  static const bool _useSoftwareAec = false;
+
   Future<void> startSession({
     String? seed,
     String? invoke,
@@ -364,20 +373,25 @@ class SiriousSessionController extends ChangeNotifier {
     _captureDuckedBase = duckCapture;
     _setPhase(SessionPhase.connecting);
 
-    // Phase 6 Stage A spike: software AEC on the speaker path.
-    try {
-      _aecPipeline ??= AecPipeline(
-        onStatsLine: (line) {
-          _pushBargeInLine(line);
-          unawaited(_logToFile(line));
-        },
-      );
-      _aecPipeline!.resetMetrics();
-      _connectAecTap();
-    } catch (error) {
-      // No native lib (or stub ABI) → run without AEC, same as pre-spike.
-      _aecPipeline = null;
-      unawaited(_logToFile('AEC init failed: $error'));
+    // Stage B→C (30 Aug): PLATFORM AEC path. Capture profile routes the mic
+    // through Android's AcousticEchoCanceler with our playout as far-end
+    // reference (full-duplex, probe-verified). The software AEC3 pipeline is
+    // unwired (backup only — see _useSoftwareAec).
+    if (_useSoftwareAec) {
+      try {
+        _aecPipeline ??= AecPipeline(
+          onStatsLine: (line) {
+            _pushBargeInLine(line);
+            unawaited(_logToFile(line));
+          },
+        );
+        _aecPipeline!.resetMetrics();
+        _connectAecTap();
+      } catch (error) {
+        // No native lib (or stub ABI) → run without AEC, same as pre-spike.
+        _aecPipeline = null;
+        unawaited(_logToFile('AEC init failed: $error'));
+      }
     }
 
     try {
@@ -387,7 +401,9 @@ class SiriousSessionController extends ChangeNotifier {
         seed: seed,
         invoke: invoke,
       );
-      await _audioCapture.start();
+      await _audioCapture.start(
+        profile: duckCapture ? CaptureProfile.nearTalk : CaptureProfile.speaker,
+      );
       _startKeepalive();
       _setPhase(SessionPhase.listening);
     } catch (error) {
@@ -461,9 +477,10 @@ class SiriousSessionController extends ChangeNotifier {
     //
     // Phase 6 Stage B: the duck now applies ONLY to table/ambient invocation
     // (duckCapture: true). On the speaker path capture stays OPEN during
-    // playback — AEC3 cleans the echo, the residual-aware onset threshold
-    // refuses echo-level energy, and the ghost gate rejects server-side
-    // interruption signals with no local voice evidence.
+    // playback — the PLATFORM AEC removes the echo at the HAL layer
+    // (voiceCommunication + setCommunicationDevice, probed 30 Aug), so no
+    // ducking, no software gating on the audio path. The client-side gates
+    // below remain as belt-and-suspenders for residual echo.
     if (_captureDucked &&
         (_phase == SessionPhase.playing ||
             _phase == SessionPhase.responding ||
