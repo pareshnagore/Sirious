@@ -1094,24 +1094,22 @@ playback PCM ──────┘   (far-end reference)                   (ONE 
   (its known weak spot), STOP — hard-duck remains the answer-time strategy and
   speaker mode ships ducking-only (Phase 5 C2.5 step 2/3 becomes the follow-up).
 
-**Stage B — wire into the capture path**
-- `AudioCaptureService` output passes through the APM before the WS;
-  `AudioPlaybackService` PCM feeds the render/reference leg. Far-field ambient
-  profile untouched.
-- Hard duck becomes the FALLBACK, not the primary mechanism, in near-talk
-  speaker use.
-- DONE 29 Aug (commit bd887ecd): capture→APM→WS wired (`aec_pipeline.dart`); render leg via
-  pre-feed `playbackTap`. Measurement mode: `_captureDucked=true` hardcoded in
-  `startSession` (self-interruption loop impossible while AEC unproven end-to-end).
-  On-device: est stable 84 ms, delayValid 100% (6500+ frames), echo reduction
-  22.1 dB peak / 9.8 dB sustained (gated metric). Stage A KILL-SWITCH PASSED.
-  Stage B remaining: (1) un-duck → verify NO ghost turns with capture open on
-  speaker (the end-to-end proof), (2) re-measure reduction at 2-3 MEDIA volume
-  levels — suppression is level-dependent (low volume: echo sinks toward noise
-  floor; max volume: speaker distortion breaks the linear model; delay est is
-  NOT volume-sensitive), (3) barge-in onset threshold must be set against
-  post-AEC residual at typical volume, (4) re-init AEC on audio-route change
-  (speaker↔BT↔earphone shifts the delay model).
+**Stage B — wire into the capture path** (COMPLETED 30 Aug, then SUPERSEDED
+  by platform-AEC path — see docs/phase6_speaker_checkpoint.md for the full
+  trail): software AEC3 was wired (commit 0c3563ac) and echo was killed on
+  30 Aug by switching to the PLATFORM AEC (commit 6d515ba5): capture profile
+  `speaker` = VOICE_COMMUNICATION + MODE_IN_COMMUNICATION +
+  setCommunicationDevice(SPEAKER) — the configuration ChatGPT/Perplexity use
+  (APK teardown in research/vendor_apks/FINDINGS.md). On-device: ZERO echo
+  after 3 days of loop hell. Software AEC3 remains in-repo UNWIRED
+  (`_useSoftwareAec=false`) as backup. The 25 Aug "call pipeline mutes mic"
+  verdict was wrong for the modern path (probe: PlatformAecProbe.kt).
+  REMAINING: speaker barge-in — platform-AEC capture is ~10x quieter
+  (speech 63-120 RMS vs raw 1000-8000) so server VAD doesn't fire mid-answer
+  and ASR degrades. Agreed next steps in docs/phase6_speaker_checkpoint.md:
+  (1) route-aware profiles (earphones→nearTalk flow, none→speaker),
+  (2) ~4x software gain on speaker capture, (3) startOfSpeechSensitivity=HIGH,
+  (4) client VAD + manual activityStart/End (sherpa-onnx upgrade path).
 
 **Stage C — speaker-mode session UX**
 - Mic stays open during answers; verify true barge-in mid-answer on loudspeaker.
