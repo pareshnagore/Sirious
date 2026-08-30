@@ -1,12 +1,38 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 
 import '../config/app_config.dart';
+import 'capture_route_policy.dart';
 
 typedef AudioChunkHandler = void Function(Uint8List chunk);
+
+/// Step 2 (Phase 6): applies [CaptureRoutePolicy.gainForProfile] to int16 PCM
+/// in place, BEFORE the chunk reaches barge-in onset detection or the
+/// server. Two effects to know:
+///  1. Speech on the platform-AEC path returns to raw-mic order — onset
+///     thresholds and ASR quality are back on the calibrated raw-mic curve.
+///  2. The far-end ECHO RESIDUAL is amplified by the same factor — that is
+///     why the speaker floors are POST-GAIN (240/450), never the pre-gain
+///     60/110. If ghost turns reappear, this is the first suspect: lower
+///     the gain, not the thresholds.
+/// Saturating clamp, not wrap-around (int16 wrap would turn loud speech
+/// into garbage that VAD/ASR reads as noise bursts).
+void _applyCaptureGain(Uint8List chunk, double gain) {
+  if (gain == 1.0) {
+    return; // raw-mic paths (earphone/nearTalk) must stay untouched
+  }
+  final bd = ByteData.sublistView(chunk);
+  final samples = chunk.length ~/ 2;
+  for (var i = 0; i < samples; i++) {
+    final s = bd.getInt16(i * 2, Endian.little);
+    final amplified = (s * gain).round().clamp(-32768, 32767);
+    bd.setInt16(i * 2, amplified, Endian.little);
+  }
+}
 
 /// Capture tuning per session mode (Phase 5/6).
 ///
@@ -39,6 +65,11 @@ class AudioCaptureService {
   static const MethodChannel _channel = MethodChannel('sirious/audio_route');
 
   StreamSubscription<Uint8List>? _subscription;
+
+  /// Gain applied to captured PCM for the CURRENT profile (set in start(),
+  /// logged with route instrumentation so evidence lines are self-describing).
+  double _gain = 1.0;
+  double get activeGain => _gain;
 
   Future<bool> ensurePermission() async {
     final status = await Permission.microphone.request();
@@ -105,7 +136,11 @@ class AudioCaptureService {
       ),
     );
 
-    _subscription = stream.listen(onChunk);
+    _gain = CaptureRoutePolicy.gainForProfile(profile);
+    _subscription = stream.listen((chunk) {
+      _applyCaptureGain(chunk, _gain);
+      onChunk(chunk);
+    });
   }
 
   Future<void> stop() async {

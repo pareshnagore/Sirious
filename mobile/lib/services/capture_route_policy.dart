@@ -29,16 +29,31 @@ abstract final class CaptureRoutePolicy {
           ? CaptureProfile.nearTalk
           : CaptureProfile.speaker;
 
-  /// Barge-in onset hard floor (idle) for [route]'s capture path. Platform-AEC
-  /// speaker capture is ~10x quieter than the raw near-talk mic (recalibrated
-  /// 30 Aug from the probe: room tone ~2-7, near speech 63-120 on the speaker
-  /// path vs 1000-8000 raw) — the old 250 would be DEAF on platform capture.
-  static double onsetHardFloor(AudioRoute route) =>
-      route == AudioRoute.speaker ? 60.0 : 250.0;
+  /// Capture gain applied on the SPEAKER path (Phase 6 step 2, 30 Aug). The
+  /// platform AEC (VOICE_COMMUNICATION) delivers near speech ~10x quieter
+  /// than the raw mic — 30 Aug sessions measured barge-in peaks 56–120 vs
+  /// the old 110 threshold: client onset missed on quiet attempts (server
+  /// VAD carried barge-in alone, ASR degraded to fragments). x4 int16 gain
+  /// restores raw-mic-order levels on this path ONLY; earphones are raw mic
+  /// already and must NEVER be amplified (keyed to the profile so no caller
+  /// can start the speaker path without it).
+  static double gainForProfile(CaptureProfile profile) =>
+      profile == CaptureProfile.speaker ? 4.0 : 1.0;
 
-  /// Onset hard floor DURING PLAYBACK for [route]. Speaker path: far-end
-  /// residual sits ~50 RMS, near speech at table distance 63-120+ → 110.
-  /// The 450 stays on the raw-mic path (calibrated for near-talk levels).
+  /// Barge-in onset hard floor (idle) for [route]'s capture path, POST-GAIN.
+  /// x4 maps pre-gain speech 63–120 → ~250–480, so the speaker floor
+  /// converges to the proven raw-mic value (240 ≈ 250) instead of the
+  /// pre-gain 60. Earphone (raw mic, gain 1): unchanged 250.
+  /// Re-verify from one instrumented session with gain applied before
+  /// trusting these (skill rule: recalibrate level-based numbers after every
+  /// capture-path change).
+  static double onsetHardFloor(AudioRoute route) =>
+      route == AudioRoute.speaker ? 240.0 : 250.0;
+
+  /// Onset hard floor DURING PLAYBACK for [route], POST-GAIN. Speaker: x4
+  /// maps the pre-gain far-end residual (~50) to ~200 → the pre-gain 110
+  /// would sit BELOW residual and false-fire on echo; 450 restores the
+  /// raw-mic margin (≈ earphone's proven value). Earphone: unchanged 450.
   static double onsetPlaybackHardFloor(AudioRoute route) =>
-      route == AudioRoute.speaker ? 110.0 : 450.0;
+      route == AudioRoute.speaker ? 450.0 : 450.0;
 }

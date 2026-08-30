@@ -238,7 +238,8 @@ class SiriousSessionController extends ChangeNotifier {
       );
       unawaited(
         _logToFile(
-          'BARGE_IN ok onset_ms=$serverMs flush_ms=$flushMs total_ms=$totalMs '
+          'BARGE_IN ok route=$_activeRoute onset_ms=$serverMs flush_ms=$flushMs '
+          'total_ms=$totalMs '
           'peak_rms=${_windowPeakRms.toStringAsFixed(0)} '
           'floor_rms=${_onsetNoiseFloor.toStringAsFixed(0)}',
         ),
@@ -256,7 +257,8 @@ class SiriousSessionController extends ChangeNotifier {
       );
       unawaited(
         _logToFile(
-          'BARGE_IN ONSET_MISSING peak_rms=${_windowPeakRms.toStringAsFixed(0)} '
+          'BARGE_IN ONSET_MISSING route=$_activeRoute '
+          'peak_rms=${_windowPeakRms.toStringAsFixed(0)} '
           'floor_rms=${_onsetNoiseFloor.toStringAsFixed(0)} '
           'onset=$onset interrupted=$interrupted stopped=$stopped',
         ),
@@ -407,6 +409,7 @@ class SiriousSessionController extends ChangeNotifier {
     unawaited(
       _logToFile(
         'ROUTE start route=$_activeRoute profile=$routeProfile '
+        'gain=${CaptureRoutePolicy.gainForProfile(routeProfile).toStringAsFixed(1)}x '
         'duck=$duckCapture',
       ),
     );
@@ -580,7 +583,7 @@ class SiriousSessionController extends ChangeNotifier {
             latency.bargeInOnsetAt = DateTime.now();
             unawaited(
               _logToFile(
-                'ONSET rms=${rms.toStringAsFixed(0)} '
+                'ONSET route=$_activeRoute rms=${rms.toStringAsFixed(0)} '
                 'thr=${threshold.toStringAsFixed(0)} floor=${_onsetNoiseFloor.toStringAsFixed(0)} '
                 'res=${residual.toStringAsFixed(0)} sustained=true',
               ),
@@ -694,7 +697,9 @@ class SiriousSessionController extends ChangeNotifier {
 
     final line =
         'ROUTE #$_routeReinitCount: $oldRoute → $route — capture restarted '
-        '(${CaptureRoutePolicy.profileForRoute(route)}, floors follow route)';
+        '(${CaptureRoutePolicy.profileForRoute(route)}, '
+        'gain=${CaptureRoutePolicy.gainForProfile(CaptureRoutePolicy.profileForRoute(route)).toStringAsFixed(1)}x, '
+        'floors follow route)';
     _pushBargeInLine(line);
     unawaited(_logToFile(line));
     notifyListeners();
