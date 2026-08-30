@@ -66,6 +66,37 @@ class MainActivity : FlutterActivity() {
                         result.error("comm_device", e.message, null)
                     }
                 }
+                "get_audio_route" -> {
+                    // Route-aware capture profiles (Phase 6 Stage C):
+                    // classify the CURRENT output route. Any wired/BT/USB
+                    // headset output counts as earphones; otherwise the
+                    // builtin speaker is assumed.
+                    try {
+                        val am = getSystemService(AudioManager::class.java)
+                        val hasHeadset = am.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                            .any {
+                                it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+                                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                            }
+                        result.success(if (hasHeadset) "earphones" else "speaker")
+                    } catch (e: Exception) {
+                        result.error("audio_route", e.message, null)
+                    }
+                }
+                "clear_comm_device" -> {
+                    // Undo a previous speaker-mode setCommunicationDevice
+                    // pin so playback follows the natural route again.
+                    try {
+                        getSystemService(AudioManager::class.java)
+                            .clearCommunicationDevice()
+                        result.success("ok")
+                    } catch (e: Exception) {
+                        result.error("comm_device", e.message, null)
+                    }
+                }
                 else -> result.notImplemented()
             }
         }

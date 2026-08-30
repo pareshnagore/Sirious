@@ -115,25 +115,58 @@ class AudioPlaybackService {
     await _drain();
   }
 
+  /// Stop playback on barge-in / session end.
+  ///
+  /// HARD (default): drop the queue AND release the native player — the
+  /// speaker goes silent the instant release() runs. This is the Phase 1-4
+  /// behavior (verified good on the earphone path) and is now the default
+  /// for every route while the software AEC3 is UNWIRED: with PLATFORM AEC
+  /// as the echo canceller there is no client-side delay model to protect,
+  /// so the old reason for soft flush (below) no longer applies.
+  ///
+  /// SOFT (hard: false): drop queued audio and stop feeding, native track
+  /// untouched. ONLY for when the software AEC3 pipeline is re-enabled
+  /// (_useSoftwareAec): releasing + re-setting up on barge-in changes the
+  /// playout-path latency and permanently invalidates the AEC3 delay model
+  /// mid-session (measured 30 Aug: est 84→300 ms, reduction 21.3→2.9 dB).
   /// Soft stop: drop queued audio and STOP FEEDING, but do NOT release the
   /// native player (see the class doc — releasing on barge-in broke the AEC
   /// delay model for the rest of the session). The native feed buffer holds
   /// only ~100 ms after the last feed, so the speaker goes silent quickly.
   /// Returns the wall-clock time the flush ran — an upper bound on when the
   /// speaker actually goes silent (≤~200 ms later, buffer drain).
-  Future<DateTime?> flush() async {
+  Future<DateTime?> flush({bool hard = true}) async {
     if (!_initialized) {
       return null;
     }
 
     _flushing = true;
     _queue.clear();
-    // Let an in-flight _drain() observe _flushing and bail before its next
-    // feed — at most one extra chunk (~10-40 ms) plays past this point.
-    await Future<void>.delayed(Duration.zero);
 
-    final stopTime = DateTime.now();
-    _flushing = false;
+    if (!hard) {
+      // SOFT: let an in-flight _drain() observe _flushing and bail before
+      // its next feed — at most one extra chunk (~10-40 ms) plays past
+      // this point, and the native buffer drains to silence shortly after.
+      await Future<void>.delayed(Duration.zero);
+      final softStop = DateTime.now();
+      _flushing = false;
+      return softStop;
+    }
+
+    // HARD: release the native engine — silence is immediate. Timestamp
+    // HERE; the re-setup below is extra latency, not silence.
+    DateTime? stopTime;
+    try {
+      await FlutterPcmSound.release();
+      stopTime = DateTime.now();
+      await _setupOutput();
+      await FlutterPcmSound.setFeedThreshold(
+        AppConfig.outputSampleRate ~/ 10,
+      );
+    } finally {
+      _flushing = false;
+    }
+
     return stopTime;
   }
 

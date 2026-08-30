@@ -24,6 +24,9 @@ typedef AudioChunkHandler = void Function(Uint8List chunk);
 ///   MODE_NORMAL+speakerphone path is half-duplex and kills near-end voice).
 ///   The 25 Aug "call pipeline mutes the mic" verdict tested only the legacy
 ///   path and misread platform-AEC residual as mute.
+/// Stage C (1): the ACTIVE profile is chosen per AUDIO ROUTE by
+/// CaptureRoutePolicy (earphones → nearTalk, none → speaker) — callers
+/// never hardcode a profile for route reasons.
 enum CaptureProfile { nearTalk, farField, speaker }
 
 /// Captures microphone PCM at 16 kHz mono for protocol v1.
@@ -60,6 +63,14 @@ class AudioCaptureService {
         await _channel.invokeMethod('set_speaker_comm_device');
       } catch (_) {
         // Channel missing / pre-API-31: record's speakerphone flag covers it.
+      }
+    } else {
+      // Undo a previous speaker-mode communication-device pin so playback
+      // follows the natural route (earphone/BT) again.
+      try {
+        await _channel.invokeMethod('clear_comm_device');
+      } catch (_) {
+        // Channel missing / pre-API-31 — nothing to clear.
       }
     }
 

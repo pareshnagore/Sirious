@@ -12,6 +12,7 @@ import 'aec_pipeline.dart';
 import 'audio_capture_service.dart';
 import 'audio_playback_service.dart';
 import 'audio_route_watcher.dart';
+import 'capture_route_policy.dart';
 import 'ghost_echo_detector.dart';
 import 'websocket_client.dart';
 
@@ -25,9 +26,9 @@ class SiriousSessionController extends ChangeNotifier {
       onDone: _onSocketDone,
       onError: _onSocketError,
     );
-    _routeSub = AudioRouteWatcher.instance.routeChanges.listen(
-      (_) => _onAudioRouteChanged(),
-    );
+    _routeSub = AudioRouteWatcher.instance.routeChanges.listen((_) {
+      unawaited(_onAudioRouteChanged());
+    });
   }
 
   late final AudioCaptureService _audioCapture;
@@ -96,15 +97,23 @@ class SiriousSessionController extends ChangeNotifier {
   /// per-turn duck restores to at turn boundaries).
   bool _captureDuckedBase = false;
 
-  // ── Stage B (B4): route-change AEC re-init ───────────────────────────────
-  // Speaker ↔ BT ↔ earphone shifts the acoustic echo path (delay + impulse
-  // response). AEC3 adapts eventually, but re-creating the pipeline gives a
-  // clean estimator immediately. Only rebuilt while a session is live; the
-  // subscription lives for the controller's lifetime.
+  // ── Stage C (1): route-aware capture profiles ────────────────────────────
+  // The ACTIVE capture profile follows the AUDIO ROUTE (Perplexity's
+  // AudioCommunicationRoutePolicy pattern): earphones/BT connected →
+  // nearTalk (raw MIC — the mic physically can't hear the speaker; best
+  // quality; server VAD works as-is), builtin speaker → the platform-AEC
+  // profile. A route-CLASS change MID-SESSION restarts capture on the new
+  // profile (cooldown-coalesced). The subscription lives for the
+  // controller's lifetime.
   StreamSubscription<void>? _routeSub;
   static const int _routeReinitCooldownMs = 3000;
   DateTime _lastRouteReinitAt = DateTime.fromMillisecondsSinceEpoch(0);
   int _routeReinitCount = 0;
+
+  /// Output route the CURRENT capture profile was built for. Detected at
+  /// session start and re-classified on every route_changed event.
+  AudioRoute _activeRoute = AudioRoute.speaker;
+  AudioRoute get activeRoute => _activeRoute;
 
   /// Backoff delay for the Nth retry (1s, 2s, 4s, … capped at 8s).
   Duration _reconnectDelay() {
@@ -123,11 +132,10 @@ class SiriousSessionController extends ChangeNotifier {
   /// Onset fires when: rms > max(noiseFloor * riseFactor, hardFloor).
   /// Speck chunks far above silence are excluded from the floor so speech
   /// never inflates the baseline (which would suppress detection).
-  /// RECALIBRATED 30 Aug for PLATFORM AEC capture (voiceCommunication +
-  /// InCommunication): probe showed room tone ~2-7, real near speech 63-120+
-  /// (vs the old RAW mic's 1000-8000). 60 keeps the same speech/noise ratio
-  /// the old 250 had against the raw mic.
-  static const double _onsetHardFloor = 60.0;
+  /// Floors follow the ACTIVE route (CaptureRoutePolicy): platform-AEC
+  /// speaker capture is ~10x quieter than the raw near-talk mic.
+  double get _onsetHardFloor =>
+      CaptureRoutePolicy.onsetHardFloor(_activeRoute);
   static const double _onsetRiseFactor = 4.0;
   static const int _noiseWindowChunks = 20; // ~2s at 100ms chunks
 
@@ -136,12 +144,10 @@ class SiriousSessionController extends ChangeNotifier {
   /// Kept for the software-AEC backup path.
   static const double _residualRiseFactor = 8.0;
 
-  /// Onset hard floor DURING PLAYBACK. With PLATFORM AEC (probe 30 Aug),
-  /// far-end residual sits ~50 RMS and near speech at table distance 63-120+.
-  /// The old 450 (raw-mic calibration) was deaf to real users — "barge-in
-  /// not working". 110 clears residual (~50) with margin, sits under real
-  /// speech onset at table distance.
-  static const double _onsetPlaybackHardFloor = 110.0;
+  /// Onset hard floor DURING PLAYBACK, per ACTIVE route (speaker
+  /// platform-AEC residual sits ~50 RMS → 110; raw-mic path keeps 450).
+  double get _onsetPlaybackHardFloor =>
+      CaptureRoutePolicy.onsetPlaybackHardFloor(_activeRoute);
 
   /// Stage B (B3): voice-like recency window. The ghost gate accepts Gemini's
   /// `interrupted` / transcript-during-playback only if a client-side voice
@@ -291,7 +297,13 @@ class SiriousSessionController extends ChangeNotifier {
     final voiceRecent =
         lastVoice != null &&
         receivedAt.difference(lastVoice).inMilliseconds <= _onsetRecencyMs;
-    if (!voiceRecent) {
+    if (_useSoftwareAec && !voiceRecent) {
+      // Energy ghost gate — ONLY meaningful while the software AEC3 is
+      // wired: residual echo reaching Gemini's VAD with no local voice
+      // evidence. With the gate's premise gone (platform AEC on speaker,
+      // earphones can't hear playout at all), rejecting here swallowed
+      // REAL barge-ins (measured 30 Aug earphone: GHOST_REJECT on genuine
+      // speech → duck instead of flush → answer played to the end).
       unawaited(
         _logToFile(
           'GHOST_REJECT ${_clock(receivedAt)} '
@@ -318,7 +330,10 @@ class SiriousSessionController extends ChangeNotifier {
 
     DateTime? stoppedAt;
     try {
-      stoppedAt = await _audioPlayback.flush();
+      // Hard flush (instant silence) unless the software AEC3 pipeline is
+      // wired — releasing the track mid-session invalidates THAT model.
+      // Platform AEC (the primary path) has no client-side model to lose.
+      stoppedAt = await _audioPlayback.flush(hard: !_useSoftwareAec);
     } catch (error, stackTrace) {
       debugPrint('Barge-in flush failed: $error\n$stackTrace');
     }
@@ -356,6 +371,11 @@ class SiriousSessionController extends ChangeNotifier {
     // answers in one History entry). Normal 1:1 mode generates a fresh id.
     _clientSessionId = clientSessionId ?? _generateClientSessionId();
     _turns.clear();
+    // The on-screen barge-in panel is a PER-SESSION view: stale lines from
+    // the previous session read as current-session evidence. (The durable
+    // sirious_bargein.log file keeps appending across sessions by design —
+    // adb-pull debugging lifeline.)
+    _bargeInLog.clear();
     _currentUserText = '';
     _currentAssistantText = '';
     _currentTurnStartedAt = null;
@@ -373,10 +393,23 @@ class SiriousSessionController extends ChangeNotifier {
     _captureDuckedBase = duckCapture;
     _setPhase(SessionPhase.connecting);
 
-    // Stage B→C (30 Aug): PLATFORM AEC path. Capture profile routes the mic
-    // through Android's AcousticEchoCanceler with our playout as far-end
-    // reference (full-duplex, probe-verified). The software AEC3 pipeline is
-    // unwired (backup only — see _useSoftwareAec).
+    // Stage C (1): capture profile follows the AUDIO ROUTE. Earphones →
+    // nearTalk (raw mic; no echo possible); builtin speaker → the
+    // platform-AEC profile (voiceCommunication + InCommunication, probed
+    // 30 Aug). The software AEC3 pipeline stays unwired (backup — see
+    // _useSoftwareAec).
+    _activeRoute = CaptureRoutePolicy.classifyRoute(
+      await AudioRouteWatcher.instance.detectRoute(),
+    );
+    final routeProfile = duckCapture
+        ? CaptureProfile.nearTalk // ambient C2: capture ducked during playback
+        : CaptureRoutePolicy.profileForRoute(_activeRoute);
+    unawaited(
+      _logToFile(
+        'ROUTE start route=$_activeRoute profile=$routeProfile '
+        'duck=$duckCapture',
+      ),
+    );
     if (_useSoftwareAec) {
       try {
         _aecPipeline ??= AecPipeline(
@@ -402,7 +435,7 @@ class SiriousSessionController extends ChangeNotifier {
         invoke: invoke,
       );
       await _audioCapture.start(
-        profile: duckCapture ? CaptureProfile.nearTalk : CaptureProfile.speaker,
+        profile: routeProfile,
       );
       _startKeepalive();
       _setPhase(SessionPhase.listening);
@@ -589,15 +622,28 @@ class SiriousSessionController extends ChangeNotifier {
     _audioPlayback.playbackTap = (chunk) => _aecPipeline?.feedRender(chunk);
   }
 
-  /// Stage B (B4): the audio output route changed → rebuild the AEC pipeline
-  /// so the delay estimator re-locks on the new echo path instead of grinding
-  /// through a re-adaptation transient (or diverging on a big delay jump).
-  void _onAudioRouteChanged() {
-    if (_phase != SessionPhase.playing &&
-        _phase != SessionPhase.responding &&
-        _phase != SessionPhase.listening &&
-        _phase != SessionPhase.interrupting) {
-      return; // no live session → next startSession() builds fresh anyway
+  /// Stage C (1): the audio output route changed → re-classify and, on a
+  /// route-CLASS change (earphones ↔ speaker), restart capture on the new
+  /// profile MID-SESSION. Within-class device changes (BT↔wired, speaker
+  /// swaps) keep the current profile — both profiles ride whatever the OS
+  /// hands them. The software AEC3 pipeline (when re-enabled) is rebuilt
+  /// with the capture: a route change shifts the echo path, so its delay
+  /// estimator must re-lock on the new one.
+  Future<void> _onAudioRouteChanged() async {
+    final route = CaptureRoutePolicy.classifyRoute(
+      await AudioRouteWatcher.instance.detectRoute(),
+    );
+    if (route == _activeRoute) {
+      unawaited(
+        _logToFile('ROUTE event → same class ($_activeRoute) — no-op'),
+      );
+      return;
+    }
+    if (!_phase.isActive) {
+      // No live session: remember it; the next startSession() picks the
+      // fresh profile anyway.
+      _activeRoute = route;
+      return;
     }
     final now = DateTime.now();
     if (now.difference(_lastRouteReinitAt).inMilliseconds <
@@ -606,28 +652,51 @@ class SiriousSessionController extends ChangeNotifier {
     }
     _lastRouteReinitAt = now;
     _routeReinitCount++;
+    final oldRoute = _activeRoute;
+    _activeRoute = route;
 
     try {
-      _aecPipeline?.dispose();
+      await _audioCapture.stop();
     } catch (_) {}
     try {
-      _aecPipeline = AecPipeline(
-        onStatsLine: (line) {
-          _pushBargeInLine(line);
-          unawaited(_logToFile(line));
-        },
+      await _audioCapture.start(
+        profile: CaptureRoutePolicy.profileForRoute(route),
       );
-      _connectAecTap();
-      final line =
-          'ROUTE re-init #$_routeReinitCount — AEC rebuilt for new output route';
-      _pushBargeInLine(line);
-      unawaited(_logToFile(line));
     } catch (error) {
-      // Route change hit while the native lib is unavailable — drop the AEC
-      // leg and keep the session alive (same policy as init failure).
-      _aecPipeline = null;
-      unawaited(_logToFile('AEC route re-init failed: $error'));
+      _errorMessage = 'Capture restart failed after route change: $error';
+      unawaited(_logToFile('ROUTE restart FAILED: $error'));
+      notifyListeners();
+      return;
     }
+
+    if (_useSoftwareAec) {
+      try {
+        _aecPipeline?.dispose();
+      } catch (_) {}
+      try {
+        _aecPipeline = AecPipeline(
+          onStatsLine: (line) {
+            _pushBargeInLine(line);
+            unawaited(_logToFile(line));
+          },
+        );
+        _connectAecTap();
+      } catch (err) {
+        _aecPipeline = null;
+        unawaited(_logToFile('AEC route re-init failed: $err'));
+      }
+    }
+
+    // The onset window re-learns on the NEW capture path: stale noise-floor
+    // samples from the old path (10x level difference) would deafen or
+    // saturate the threshold for up to the full 2s window.
+    _endOnsetWindow();
+
+    final line =
+        'ROUTE #$_routeReinitCount: $oldRoute → $route — capture restarted '
+        '(${CaptureRoutePolicy.profileForRoute(route)}, floors follow route)';
+    _pushBargeInLine(line);
+    unawaited(_logToFile(line));
     notifyListeners();
   }
 
@@ -753,6 +822,19 @@ class SiriousSessionController extends ChangeNotifier {
         break;
 
       case 'turn_complete':
+        // Fix 30 Aug: if an ACCEPTED interruption is mid-flight (its flush
+        // await suspended this handler chain), turn_complete arriving
+        // mid-flight must NOT commit the turn as non-interrupted and wipe
+        // the barge-in measurements before _handleInterruption's
+        // continuation does it — that race ate the on-screen (interrupted)
+        // tag and the latency numbers (log: ONSET_MISSING peak_rms=0).
+        if (_interruptionHandled) {
+          // The interrupted handler's continuation commits (interrupted:
+          // true) and resets the onset window; just close the detector's
+          // turn bookkeeping.
+          _ghostDetector.markTurnComplete();
+          break;
+        }
         _endOnsetWindow();
         _commitCurrentTurn(interrupted: false);
         _setPhase(SessionPhase.listening);
