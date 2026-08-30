@@ -1,2 +1,6 @@
 .env
 *.pcm
+
+# Vendor APK teardown binaries (large, third-party copyrighted)
+research/vendor_apks/*.apk
+research/vendor_apks/lib/
