@@ -670,6 +670,16 @@ async def websocket_endpoint(
     #           anything to the mic.
     seed = _clean_query_text(websocket.query_params.get("seed"), 4000)
     invoke = _clean_query_text(websocket.query_params.get("invoke"), 500)
+    # Phase 6 step 4 (manual client VAD): vad=manual disables the server's
+    # automatic activity detection — the CLIENT owns turn boundaries and
+    # sends activity_start/activity_end signals relayed below. This removes
+    # the server-side ghost class (the model interrupting itself on its own
+    # amplified residual). Absent/default → server VAD as before (earphone
+    # path unchanged).
+    vad_mode = _clean_query_text(websocket.query_params.get("vad"), 20)
+    manual_vad = vad_mode == "manual"
+    if vad_mode and vad_mode != "manual":
+        log_event(session_id, "vad_param_unknown", value=vad_mode)
     ambient_block = _ambient_seed_block(seed)
     if invoke:
         log_event(session_id, "invoke_param", chars=len(invoke))
@@ -940,7 +950,7 @@ async def websocket_endpoint(
                 # steers the response to always be English regardless of what
                 # language the input is transcribed/interpreted as.
                 system_instruction=(
-                                    "You are Sirious, a helpful and concise voice assistant. "
+                                    "You are Peter, a helpful and concise voice assistant. "
                                     "ALWAYS respond in English, no matter what language the "
                                     "user speaks or is detected as speaking."
                                     + tools_hint
@@ -956,6 +966,27 @@ async def websocket_endpoint(
                 output_audio_transcription=(
                     types.AudioTranscriptionConfig()
                 ),
+
+                # Phase 6 step 4: manual client VAD (vad=manual handshake).
+                # Client owns turn boundaries — activity_start/activity_end
+                # arrive as realtime inputs (relayed in client_to_gemini).
+                # Docs (live-guide, "Disable automatic VAD", read 30 Aug):
+                # client detects speech, sends activityStart/activityEnd;
+                # an activityEnd marks the interruption; no audioStreamEnd
+                # is used in this mode.
+                **(
+                    {
+                        "realtime_input_config": types.RealtimeInputConfig(
+                            automatic_activity_detection=(
+                                types.AutomaticActivityDetection(
+                                    disabled=True,
+                                )
+                            ),
+                        ),
+                    }
+                    if manual_vad
+                    else {}
+                ),
             ),
         ) as session:
 
@@ -963,6 +994,7 @@ async def websocket_endpoint(
                 "type": "session_started",
                 "session_id": session_id,
                 "resumed": resumed,
+                "vad_mode": "manual" if manual_vad else "server",
             })
 
             # C2 invocation: the room transcript already contains the user's
@@ -1046,6 +1078,28 @@ async def websocket_endpoint(
                                 await websocket.send_json({
                                     "type": "pong"
                                 })
+
+                            elif manual_vad and control == "activity_start":
+                                # Phase 6 step 4: client-detected speech
+                                # onset → start of a user activity window.
+                                # Q (probe settles): whether generation
+                                # cancels here or only on activity_end.
+                                await session.send_realtime_input(
+                                    activity_start=types.ActivityStart()
+                                )
+                                log_event(
+                                    session_id,
+                                    "activity_start_relayed",
+                                )
+
+                            elif manual_vad and control == "activity_end":
+                                await session.send_realtime_input(
+                                    activity_end=types.ActivityEnd()
+                                )
+                                log_event(
+                                    session_id,
+                                    "activity_end_relayed",
+                                )
 
                 except WebSocketDisconnect:
 
