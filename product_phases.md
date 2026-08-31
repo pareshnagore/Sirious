@@ -1151,6 +1151,29 @@ playback PCM ──────┘   (far-end reference)                   (ONE 
   in-flight barge-in flushes (session-2 disconnect: rapid windows →
   back-to-back resumption updates → EVENT error; auto-reconnect recovered);
   (2) commit/push of step-4→4.6 client+backend work.
+- **Step 5 — S2 hardening (31 Aug, root-cause found + built same day)**: root-cause
+  correction from prod logs — the S2 failure was NOT a resumption-update
+  race: session 6f689950 was a FRESH conversation (new client_session_id,
+  resumed=false, no handle consumed) that died with websocket close 1007
+  "Precondition check failed" after 4 rapid manual-VAD activity windows in
+  15 s (end→start flip 78 ms apart; final start left open). Google-side
+  state-machine sensitivity to rapid activity churn; resumption updates were
+  a symptom, not the cause. Also found: the Gemini leg lingers ~2.5 min
+  after a client "stop" until Gemini's own 1008-aborted cleanup (7/7
+  gemini_error entries that day were this). Hardening shipped: (a) activity
+  relay guard (`app/relay.py`) — duplicate starts/unbalanced ends collapsed
+  before reaching Gemini, with *_suppressed event logs; (b) fast Gemini-leg
+  teardown on clean client stop/disconnect (1008 noise gone, sessions not
+  wasted); (c) transparent Gemini-leg recovery — when Gemini kills the
+  session while the phone is healthy, the server probes liveness with the
+  error frame, then sends `session_recovering` + close 4402 so the phone's
+  proven blip-reconnect re-enters the SAME conversation via protocol-v2
+  resumption (~1-2 s reconnect flash; zero client changes). Uses the same
+  machinery as the 10-min go_away/resumption stitch, different trigger
+  (Google bug vs time limit). Earphone behavior unchanged (guard is a no-op
+  off manual VAD; recovery is route-agnostic). Committed to speaker-mode;
+  deploy pending user go-ahead — validate on device after deploy (rapid
+  barge-in stress + a normal session on each route).
 
 ### Later add-on (zero ML): notes-per-speaker by name declaration
 

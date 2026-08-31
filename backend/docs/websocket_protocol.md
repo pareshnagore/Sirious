@@ -388,6 +388,28 @@ Reply to client `ping`.
 
 The session may end after an error. Clients should show the message and return to idle.
 
+### `session_recovering` (protocol v2, Phase 6 step 5)
+
+```json
+{
+  "type": "session_recovering"
+}
+```
+
+Sent when the **Gemini leg** dies mid-conversation while the client leg is
+still healthy (e.g. Gemini closes the session after rapid barge-ins —
+"1007 Precondition check failed", seen in prod 31 Aug 2026). Immediately
+after this event the server closes the socket with close code **4402**
+(`CLOSE_RECOVER`, app-defined). The client's normal network-blip
+auto-reconnect then takes over: reconnecting with the SAME
+`client_session_id` resumes the SAME Gemini conversation via protocol-v2
+resumption (handle was stored on every update). To the user this appears
+as a brief "reconnecting…" flash — no conversation loss, no action needed.
+
+| Close code | Meaning | Client action |
+|------|---------|---------------|
+| `4402 CLOSE_RECOVER` | Gemini leg lost; conversation resumable | Auto-reconnect (blip path); do NOT reset UI state |
+
 ---
 
 ### Assistant audio

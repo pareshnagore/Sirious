@@ -28,6 +28,7 @@ from .fcm import (
     DeviceTokenStore,
     deliver_reminder_to_all_devices,
 )
+from .relay import ActivityWindowGuard
 
 
 app = FastAPI()
@@ -90,6 +91,13 @@ def check_ws_auth(websocket: WebSocket, client_session_id: str | None) -> bool:
 RESUME_HANDLE_TTL_S = 2 * 60 * 60  # 2 hours
 
 _resume_handles: dict[str, dict] = {}
+
+# Phase 6 step 5: distinctive WS close code for "Gemini leg lost, phone
+# should reconnect to resume the SAME conversation". 4xxx codes are app-
+# defined (4000-4999 reserved for private use per RFC 6455) — the phone's
+# blip reconnect path treats ANY abnormal close as reconnect-worthy, and
+# this code makes the cause diagnosable in logs on both sides.
+CLOSE_RECOVER = 4402
 
 
 def _store_handle(client_session_id: str, handle: str) -> None:
@@ -696,6 +704,32 @@ async def websocket_endpoint(
     if resume_handle is not None:
         resumed = True
 
+    # ── Phase 6 step 5: S2 hardening state ─────────────────────────────────
+    # How the CLIENT leg ended (set by the gather below):
+    #   "stopped"           — clean client stop/disconnect; Gemini leg is
+    #                         torn down eagerly in the finally block.
+    #   "recovery_handoff"  — Gemini died while the client was healthy; we
+    #                         asked the phone to reconnect (CLOSE_RECOVER)
+    #                         and protocol-v2 resumption rebuilds context.
+    #   "gemini_closed"     — Gemini died while the client leg was ALSO
+    #                         already gone (the common case — nothing to do).
+    client_leg_outcome = "stopped"
+    # Task handles, pre-initialized so the outer finally is safe even when
+    # the Gemini connect itself fails before the tasks are created.
+    gemini_task: asyncio.Task | None = None
+    client_task: asyncio.Task | None = None
+    # Latest resumption handle seen on THIS Gemini leg. On a mid-conversation
+    # Gemini death we close the client socket with CLOSE_RECOVER; the phone's
+    # blip reconnect then hits _pop_handle above — this cache bridges the
+    # race where the newest update has not been stored yet (store happens on
+    # every resumable update anyway; the cache is belt-and-braces and feeds
+    # the event log's diagnostics).
+    last_resumption_handle: str | None = resume_handle
+    # Relay guard: collapses duplicate/unbalanced activity signals before
+    # they reach Gemini's state machine (the S2 1007 precondition class).
+    # Only used when the client owns turn boundaries (vad=manual).
+    activity_guard = ActivityWindowGuard() if manual_vad else None
+
     # Persistence (Phase 2): one Firestore doc per LOGICAL conversation —
     # doc id == client_session_id, so a resuming reconnect EXTENDS the same
     # document rather than creating a new one.
@@ -1082,23 +1116,35 @@ async def websocket_endpoint(
                             elif manual_vad and control == "activity_start":
                                 # Phase 6 step 4: client-detected speech
                                 # onset → start of a user activity window.
-                                # Q (probe settles): whether generation
-                                # cancels here or only on activity_end.
-                                await session.send_realtime_input(
-                                    activity_start=types.ActivityStart()
-                                )
+                                # Step 5: relayed through the window guard —
+                                # duplicate starts are suppressed instead of
+                                # hitting Gemini's activity state machine
+                                # (S2 1007 precondition class).
+                                decision = activity_guard.on_start()
+                                if decision.forward:
+                                    await session.send_realtime_input(
+                                        activity_start=types.ActivityStart()
+                                    )
                                 log_event(
                                     session_id,
-                                    "activity_start_relayed",
+                                    "activity_start_relayed"
+                                    if decision.forward
+                                    else "activity_start_suppressed",
+                                    guard=decision.reason,
                                 )
 
                             elif manual_vad and control == "activity_end":
-                                await session.send_realtime_input(
-                                    activity_end=types.ActivityEnd()
-                                )
+                                decision = activity_guard.on_end()
+                                if decision.forward:
+                                    await session.send_realtime_input(
+                                        activity_end=types.ActivityEnd()
+                                    )
                                 log_event(
                                     session_id,
-                                    "activity_end_relayed",
+                                    "activity_end_relayed"
+                                    if decision.forward
+                                    else "activity_end_suppressed",
+                                    guard=decision.reason,
                                 )
 
                 except WebSocketDisconnect:
@@ -1143,6 +1189,8 @@ async def websocket_endpoint(
                 nonlocal turn_generation_complete
                 nonlocal turn_complete
                 nonlocal turn_interrupted
+                nonlocal client_leg_outcome
+                nonlocal last_resumption_handle
                 try:
 
                     while True:
@@ -1265,6 +1313,12 @@ async def websocket_endpoint(
                                             client_session_id,
                                             update.new_handle,
                                         )
+
+                                    # Step 5: remember it for the recovery
+                                    # path (see client_leg_outcome docs).
+                                    last_resumption_handle = (
+                                        update.new_handle
+                                    )
 
                                     log_event(
                                         session_id,
@@ -1449,13 +1503,49 @@ async def websocket_endpoint(
                         error=repr(e),
                     )
 
+                    # ── Phase 6 step 5: transparent Gemini-leg recovery ──
+                    # Gemini sometimes kills the session mid-conversation
+                    # while the CLIENT leg is perfectly healthy (S2, 31 Aug:
+                    # rapid barge-ins → close 1007 "Precondition check
+                    # failed"). The phone cannot see this leg, so it never
+                    # reconnects on its own — the conversation just dies.
+                    # Detect "client still attached" by trying to send the
+                    # error frame: a live socket accepts it, a dead one
+                    # raises. On a live client, hand the phone to its own
+                    # battle-tested blip-reconnect (Phase 1) instead of
+                    # letting the conversation die silently: we signal
+                    # CLOSE_RECOVER and exit — the phone re-dials in ~1-2 s
+                    # with the SAME client_session_id, and protocol-v2
+                    # resumption (resume handle stored on every update)
+                    # rebuilds the SAME Gemini conversation. To the user
+                    # this shows as a brief "reconnecting…" flash, not a
+                    # dead session.
+                    client_still_attached = False
                     with contextlib.suppress(Exception):
-
                         await websocket.send_json({
                             "type": "error",
                             "code": "GEMINI_ERROR",
                             "message": str(e),
                         })
+                        client_still_attached = True
+
+                    if client_still_attached:
+                        client_leg_outcome = "recovery_handoff"
+                        log_event(
+                            session_id,
+                            "gemini_leg_recovery_handoff",
+                            handle_available=last_resumption_handle
+                            is not None,
+                        )
+                        with contextlib.suppress(Exception):
+                            await websocket.send_json({
+                                "type": "session_recovering",
+                            })
+                            await websocket.close(
+                                code=CLOSE_RECOVER,
+                                reason="gemini leg lost — reconnect to resume",
+                            )
+                    # Client gone too: the common case, nothing to recover.
 
                 finally:
 
@@ -1476,6 +1566,8 @@ async def websocket_endpoint(
             gemini_task = asyncio.create_task(
                 gemini_to_client()
             )
+            client_task.set_name("sirious:client_to_gemini")
+            gemini_task.set_name("sirious:gemini_to_client")
 
             try:
 
@@ -1485,6 +1577,16 @@ async def websocket_endpoint(
                 )
 
             finally:
+
+                # Record HOW the client leg ended (drives the finally-block
+                # teardown policy below). Cancellation or an exception on
+                # the client task means the client leg is already gone —
+                # there is no "stop" to race a Gemini teardown against.
+                if client_task.cancelled() or (
+                    client_task.done()
+                    and client_task.exception() is not None
+                ):
+                    client_leg_outcome = "gemini_closed"
 
                 for task in (
                     client_task,
@@ -1526,6 +1628,24 @@ async def websocket_endpoint(
                 "session_ended"
             )
 
+        # Phase 6 step 5: when the CLIENT leg ended by deliberate stop or
+        # clean disconnect, tear the Gemini leg down immediately instead of
+        # leaving it draining (~2.5 min until Gemini's own "1008 aborted"
+        # cleanup — measured on prod logs 31 Aug). The receive loop's
+        # CancelledError path exits the connect context manager, which
+        # closes the Gemini session cleanly. The stored resumption handle
+        # is untouched (it was persisted on every update), so a phone that
+        # disconnected for a blip still resumes on reconnect. A recovery
+        # handoff ("recovery_handoff") needs no teardown — the Gemini leg
+        # is already gone, and the phone is on its way back.
+        if (
+            client_leg_outcome == "stopped"
+            and gemini_task is not None
+            and not gemini_task.done()
+        ):
+            gemini_task.cancel()
+            await asyncio.gather(gemini_task, return_exceptions=True)
+
         # Finalize the Firestore doc (Phase 2). The queued session_end op
         # carries the full buffered turns array, so even if the instance is
         # killed right now every completed turn was already written
@@ -1533,7 +1653,11 @@ async def websocket_endpoint(
         store.end_session(
             doc_id,
             now_iso=now(),
-            reason="session_ended",
+            reason=(
+                "recovered_via_reconnect"
+                if client_leg_outcome == "recovery_handoff"
+                else "session_ended"
+            ),
             audio_in_bytes=audio_in_bytes,
             audio_out_bytes=audio_out_bytes,
         )
