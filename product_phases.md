@@ -1117,6 +1117,41 @@ playback PCM ──────┘   (far-end reference)                   (ONE 
   → check logs/screen → iterate, no hand-back between iterations).
 - Exit: earphone-grade experience on speaker, hands-free, daily-use acceptance.
 
+**Stage C progress log (through 31 Aug 2026 — speaker path):**
+
+- **Steps 1–2 (route profiles + gain)**: route-aware capture profiles shipped
+  (earphones→nearTalk raw mic, speaker→platform-AEC); 4x capture gain on the
+  speaker path, LEVEL-stamp-verified end-to-end (commits 20ce96d1, f21d88e5).
+- **Step 3 (startOfSpeechSensitivity=HIGH) SKIPPED** — wrong lever: high
+  sensitivity pushes the same mechanism that produced the ghost class.
+- **Step 4 — manual client VAD (live, prod rev 00050)**: `vad=manual`
+  handshake disables Gemini's automaticActivityDetection; the CLIENT owns
+  turn boundaries on the speaker route (activityStart/activityEnd), audio
+  streams only inside an open window. Server-side ghost class DEAD; client
+  barge-in flush 13–52 ms (vs ~250 ms server round-trip). Earphone path
+  byte-identical (server VAD untouched).
+- **Step 4.5 — adaptive levels (`adaptive_vad_policy.dart`)**: fixed floors
+  were room-calibrated by definition (150 playback floor false-fired on
+  loud-room residual 84–168; 240 onset ate quiet speech 166–249). Now:
+  listening onset = clamp(ambient×4, 80, 150); playback onset =
+  max(min(ambient,44)×4, residual_p25×2, 150); hold (close hysteresis) =
+  onset − 20; ambient window persists across turns (per-turn wipe was the
+  loud-room blind-start root cause). Design flaws caught by unit tests
+  BEFORE flashing (ambient-ratchet, hold-above-onset).
+- **Step 4.6 — sustain-gated window-open (31 Aug 17:00 fix)**: first 4.5
+  session exposed a CLIENT-driven echo loop: a single echo transient
+  (170–206 RMS) opened a false window → client flush killed the answer →
+  open window streamed residue → model answered its own echo. Fix: playback
+  windows open only on sustained voice (chunk 1 above onset AND chunk 2
+  above hold); listening keeps single-chunk open. Real barge-in cost ~100 ms.
+- **VALIDATED 31 Aug (3 speaker sessions after 4.6)**: zero echo loops, zero
+  eaten words, real barge-ins work, VAD_GATE clean. Success criteria met
+  except daily-use acceptance (user judgment, next sessions).
+- **Open items**: (1) backend — serialize session_resumption updates during
+  in-flight barge-in flushes (session-2 disconnect: rapid windows →
+  back-to-back resumption updates → EVENT error; auto-reconnect recovered);
+  (2) commit/push of step-4→4.6 client+backend work.
+
 ### Later add-on (zero ML): notes-per-speaker by name declaration
 
 When per-speaker notes first matter: speakers SAY their names before talking
