@@ -9,6 +9,7 @@ import '../models/latency_metrics.dart';
 import '../models/session_phase.dart';
 import '../models/transcript_turn.dart';
 import 'aec_pipeline.dart';
+import 'adaptive_vad_policy.dart';
 import 'audio_capture_service.dart';
 import 'audio_playback_service.dart';
 import 'audio_route_watcher.dart';
@@ -127,15 +128,36 @@ class SiriousSessionController extends ChangeNotifier {
     return '${p(dt.hour)}:${p(dt.minute)}:${p(dt.second)}.$ms';
   }
 
-  /// Barge-in onset is detected relative to the ambient noise floor so it
+  /// Barge-in onset is detected relative to the AMBIENT noise floor so it
   /// adapts to the device's real mic gain (AEC/AGC are device-dependent).
   /// Onset fires when: rms > max(noiseFloor * riseFactor, hardFloor).
   /// Speck chunks far above silence are excluded from the floor so speech
   /// never inflates the baseline (which would suppress detection).
-  /// Floors follow the ACTIVE route (CaptureRoutePolicy): platform-AEC
-  /// speaker capture is ~10x quieter than the raw near-talk mic.
+  ///
+  /// Step 4.5 (manual-VAD speaker): the DECISION is adaptive
+  /// ([_adaptiveOnset] — room term + measured-residual term, 80–150 band);
+  /// this getter is now only the FIXED speech-exclusion floor (route-based,
+  /// post-gain) used for window admission and the legacy server-VAD paths.
   double get _onsetHardFloor =>
       CaptureRoutePolicy.onsetHardFloor(_activeRoute);
+
+  /// Live ambient estimate for threshold math (source of truth is the
+  /// near-silence window; [_onsetNoiseFloor] is its logging mirror).
+  double get _ambientFloor => AdaptiveVadPolicy.ambientFloor(_recentRms);
+
+  /// Current adaptive onset decision for the ACTIVE phase (manual VAD):
+  /// listening → the room term; playback → also the measured-residual term,
+  /// with the room term clamped ([AdaptiveVadPolicy.playbackAmbientCeiling])
+  /// so a stale loud-window cannot push the playback floor past real speech.
+  double get _adaptiveOnset {
+    if (_phase == SessionPhase.playing ||
+        _phase == SessionPhase.responding ||
+        _phase == SessionPhase.interrupting) {
+      return AdaptiveVadPolicy.playbackOnset(_ambientFloor, _playbackResidual);
+    }
+    return AdaptiveVadPolicy.listeningOnset(_ambientFloor);
+  }
+
   static const double _onsetRiseFactor = 4.0;
   static const int _noiseWindowChunks = 20; // ~2s at 100ms chunks
 
@@ -144,8 +166,15 @@ class SiriousSessionController extends ChangeNotifier {
   /// Kept for the software-AEC backup path.
   static const double _residualRiseFactor = 8.0;
 
-  /// Onset hard floor DURING PLAYBACK, per ACTIVE route (speaker
-  /// platform-AEC residual sits ~50 RMS → 110; raw-mic path keeps 450).
+  /// Barge-in onset hard floor DURING PLAYBACK, per route AND gating mode.
+  /// - Manual VAD (speaker): superseded by the ADAPTIVE playback decision
+  ///   (AdaptiveVadPolicy.playbackOnset — room term + measured residual
+  ///   term). Fixed floors are room-calibrated by definition (31 Aug: fixed
+  ///   150 false-fired on loud-room residual 84–168; the earlier fixed 450
+  ///   missed real 255–305 barge-ins). This getter remains only for the
+  ///   server-VAD paths.
+  /// - Server-VAD paths (earphone, software-AEC, ducked): unchanged 450 —
+  ///   there the server decides and the 450 is the validated calibration.
   double get _onsetPlaybackHardFloor =>
       CaptureRoutePolicy.onsetPlaybackHardFloor(_activeRoute);
 
@@ -163,7 +192,169 @@ class SiriousSessionController extends ChangeNotifier {
   DateTime? _lastVoiceLikeAt; // last onset crossing while playing/responding
   bool _wasLoud = false; // previous chunk crossed threshold (sustain gate)
 
-  // ── Stage B: lexical ghost-echo detector ──────────────────────────────────
+  // ── Step 4.6: playback windows open on SUSTAINED voice only ─────────────
+  // The 17:00 loud-room loop (echo transient 170-206 > 150 clamp): EVERY
+  // false window opened on a SINGLE chunk and closed with speechChunks=1 —
+  // the open window streamed the echo residue server-side → the model
+  // answered its own echo → next answer's echo → repeat. Real speech
+  // sustains multiple chunks. So a playback window may open only when
+  // chunk 1 clears the onset threshold AND chunk 2 stays above the hold
+  // level (onset − 20). Listening phase keeps the single-chunk open (turn
+  // starts stay fast; quiet single-chunk speech like the 94-RMS "Nein."
+  // must not be eaten).
+  bool _prevChunkAboveHold = false;
+
+  // ── Step 4.5: adaptive voice levels (manual-VAD speaker path) ───────────
+  // Rolling ~1 s of playback-phase chunk RMS. [_playbackResidual] (25th
+  // percentile) measures the room's amplified residual — the floor the
+  // playback onset must clear. PERSISTS across turns so each answer is
+  // seeded with the last answer's echo (a fresh answer otherwise rides the
+  // first ~1 s blind).
+  final List<double> _playbackResidualWindow = <double>[];
+  double _playbackResidual = 0;
+
+  /// Onset decision used for the PREVIOUS chunk — the hold level rides it
+  /// (hysteresis must track the CURRENT decision, not a stale one).
+  double _prevOnsetDecision = AdaptiveVadPolicy.playbackLowerClamp;
+
+  /// Chunk-RMS admission bar for the near-silence window (both paths):
+  /// the FIXED route floor ×2. Manual VAD must NOT admit by the adaptive
+  /// value — self-referential when the signal it measures can enter the
+  /// window (loud-room residual would ratchet the "ambient" up to itself).
+  double get _ambientAdmissionFloor => _onsetHardFloor;
+
+  // ── Step 4: manual client VAD (speaker route) ───────────────────────────
+  // With automaticActivityDetection disabled, GEMINI NEVER DECIDES — it
+  // answers/resumes ONLY on our activityStart/activityEnd. That removes the
+  // server-side ghost class (30 Aug: the model interrupted itself on the
+  // amplified residual of ONE of its own words — no client floor can prevent
+  // that, because the server hears what it hears). Turn boundaries and
+  // barge-in decisions move to the client onset detector.
+  //
+  // Design (official Live API docs, read 30 Aug — "Disable automatic VAD"):
+  // client sends activityStart/activityEnd; NO audioStreamEnd in this mode;
+  // an activityEnd marks the interruption. Speech STREAMS from window-open
+  // (never before): client events cannot un-hear already-streamed audio, so
+  // gating the residue is what protects the server's "who spoke" perception.
+  // During the open window the stream stays open (platform AEC handles echo;
+  // lexical ghost filter remains the display backstop).
+  // Scope: speaker route only, software-AEC OFF, NOT ducked. Earphones stay
+  // on server VAD (verified good — do not disturb); a half-gated stream
+  // would re-starve the server VAD on the software-AEC path.
+  // Onset ratio/sustain/ghost machinery: UNCHANGED (gain cancels in ratios).
+  // Q1 (cancel on activityStart vs only activityEnd) settled by headless
+  // probe before flashing; both orderings work with the flow below.
+  static const bool _manualVadEnabled = true;
+  bool get _manualVadActive =>
+      _manualVadEnabled &&
+      _activeRoute == AudioRoute.speaker &&
+      !_useSoftwareAec &&
+      !_captureDucked;
+
+  /// The single OPEN VAD window. null = closed = stream gated.
+  DateTime? _vadOpenedAt;
+  int _vadSpeechChunks = 0;
+  int _vadSilenceChunks = 0;
+
+  /// Consecutive gated (no-window) chunks — diagnostics for the one real
+  /// manual-VAD failure mode: a threshold so high the gate eats real speech.
+  int _vadGatedChunks = 0;
+  bool _vadStallLogged = false;
+
+  static const int _vadEndOfSpeechChunks = 8; // ~800 ms trailing silence
+  static const int _vadStallLogChunks = 30; // ~3 s gated with no window
+
+  /// In-window HOLD level: the close decision uses this, NOT the onset
+  /// threshold. 31 Aug 00:00 session failure: windows closed 0.6-1.5 s into
+  /// sentences because natural speech dips below the 240 ONSET level between
+  /// syllables (VAD_GATE fired every time) — onset thresholds are calibrated
+  /// to separate speech from silence, not to mark ongoing speech. Hold level
+  /// sits clearly above the adaptive floor (word gaps hold the window) and
+  /// clearly below onset (true silence closes it). Hysteresis, textbook.
+  /// Step 4.5: ADAPTIVE — onset decision − 20. Below onset in every room by
+  /// construction (an ambient-derived hold let loud-room residual push hold
+  /// ABOVE onset — windows closed mid-speech; unit tests caught it).
+  double get _vadHoldLevel => AdaptiveVadPolicy.holdLevel(_prevOnsetDecision);
+
+  // Level stamp (gain validation): first ~2 s of chunks, once per session.
+  bool _levelStampDone = false;
+  double _levelSumSq = 0;
+  int _levelChunks = 0;
+
+  /// Open the VAD window (idempotent) — sends activityStart.
+  void _vadOpen(double rms) {
+    if (_vadOpenedAt != null) {
+      return;
+    }
+    _vadOpenedAt = DateTime.now();
+    _vadSpeechChunks = 0;
+    _vadSilenceChunks = 0;
+    _vadGatedChunks = 0;
+    _vadStallLogged = false;
+    try {
+      _webSocketClient.sendActivityStart();
+    } catch (_) {
+      // Socket down: the window still opens (stream is local); the server
+      // never sees activity and the end-of-speech path closes it. Recovered
+      // sessions re-open on the next onset.
+    }
+    final openLine =
+        'VAD_OPEN route=$_activeRoute rms=${rms.toStringAsFixed(0)} '
+        'floor=${_onsetNoiseFloor.toStringAsFixed(0)} '
+        'thr=${_adaptiveOnset.toStringAsFixed(0)}';
+    _pushBargeInLine(openLine);
+    unawaited(_logToFile(openLine));
+  }
+
+  /// Close the VAD window (idempotent) — sends activityEnd.
+  void _vadClose({required String reason}) {
+    final openedAt = _vadOpenedAt;
+    if (openedAt == null) {
+      return;
+    }
+    _vadOpenedAt = null;
+    _vadSilenceChunks = 0;
+    try {
+      _webSocketClient.sendActivityEnd();
+    } catch (_) {
+      // Socket down — nothing to signal; the server session is gone anyway.
+    }
+    final closeLine =
+        'VAD_CLOSE route=$_activeRoute reason=$reason '
+        'durationMs=${DateTime.now().difference(openedAt).inMilliseconds} '
+        'speechChunks=$_vadSpeechChunks';
+    unawaited(_logToFile(closeLine));
+    _pushBargeInLine(closeLine);
+  }
+
+  /// Per-chunk VAD window bookkeeping (call for EVERY mic chunk when manual
+  /// VAD is active). [rms] = this chunk's level; close decisions use the
+  /// HOLD level (hysteresis), not the onset threshold — word gaps must hold
+  /// the window (31 Aug 00:00 lesson), true trailing silence closes it.
+  void _vadTick({required bool speech, required double rms}) {
+    if (_vadOpenedAt != null) {
+      if (rms > _vadHoldLevel) {
+        _vadSpeechChunks++;
+        _vadSilenceChunks = 0;
+      } else {
+        _vadSilenceChunks++;
+        if (_vadSilenceChunks >= _vadEndOfSpeechChunks) {
+          _vadClose(reason: 'end_of_speech');
+        }
+      }
+    } else {
+      _vadGatedChunks = speech ? 0 : _vadGatedChunks + 1;
+      if (_vadGatedChunks >= _vadStallLogChunks && !_vadStallLogged) {
+        _vadStallLogged = true;
+        unawaited(
+          _logToFile(
+            'VAD_GATE ~3s gated with no window — if the user IS speaking, '
+            'the onset threshold is eating real speech',
+          ),
+        );
+      }
+    }
+  }
   // AEC residual at conversational volume stays intelligible enough that
   // Gemini transcribes the assistant's OWN words back as user turns (seen
   // live 29 Aug: "What can I help", "Just let me know" as You-turns). Energy
@@ -384,6 +575,15 @@ class SiriousSessionController extends ChangeNotifier {
     latency.sessionConnectedAt = null;
     latency.firstMicChunkAt = null;
     latency.resetForTurn();
+    // Step 4.5: a NEW session starts with clean adaptive state (the prior
+    // session's room/residual must not seed this one; reconnects within a
+    // session deliberately keep it).
+    _recentRms.clear();
+    _onsetNoiseFloor = 0;
+    _playbackResidualWindow.clear();
+    _playbackResidual = 0;
+    _prevOnsetDecision = AdaptiveVadPolicy.playbackLowerClamp;
+    _prevChunkAboveHold = false;
     _allowReconnect = true;
     _reconnectAttempts = 0;
     // Stage B (B1): ducking is caller-controlled again. Stage A's hardcoded
@@ -436,6 +636,7 @@ class SiriousSessionController extends ChangeNotifier {
         clientSessionId: _clientSessionId,
         seed: seed,
         invoke: invoke,
+        vadManual: _manualVadActive,
       );
       await _audioCapture.start(
         profile: routeProfile,
@@ -462,6 +663,10 @@ class SiriousSessionController extends ChangeNotifier {
   Future<void> _cleanupSession({required SessionPhase endPhase}) async {
     _allowReconnect = false;
     _captureDucked = false;
+    _vadClose(reason: 'session_end');
+    _levelStampDone = false;
+    _levelSumSq = 0;
+    _levelChunks = 0;
     _stopKeepalive();
     _reconnectTimer?.cancel();
     _reconnectTimer = null;
@@ -492,6 +697,29 @@ class SiriousSessionController extends ChangeNotifier {
 
   void _onMicChunk(Uint8List chunk) {
     latency.firstMicChunkAt ??= DateTime.now();
+
+    // Gain validation stamp (step 2 follow-up): average the first ~2 s of
+    // chunks and log the level ONCE per session. With gain g, pre-gain RMS
+    // = value/gain — the first instrumented session settles whether the 4x
+    // is end-to-end by numbers instead of inference (30 Aug night session
+    // left it open: peaks 95-135 sat where pre-gain numbers were).
+    if (!_levelStampDone && _manualVadActive) {
+      final rms = _rms(chunk);
+      _levelSumSq += rms * rms;
+      _levelChunks++;
+      if (_levelChunks >= 20) {
+        _levelStampDone = true;
+        final ambient = math.sqrt(_levelSumSq / _levelChunks);
+        final gain = _audioCapture.activeGain;
+        unawaited(
+          _logToFile(
+            'LEVEL ambient_rms=${ambient.toStringAsFixed(1)} '
+            'gain=${gain.toStringAsFixed(1)}x '
+            'pre_gain_rms=${(ambient / gain).toStringAsFixed(1)}',
+          ),
+        );
+      }
+    }
 
     // Phase 6 Stage A: AEC processes the mic BEFORE anything else consumes
     // it, so barge-in onset and Gemini both see echo-cancelled audio.
@@ -527,6 +755,12 @@ class SiriousSessionController extends ChangeNotifier {
     // Barge-in onset: track mic energy while Sirious is talking (including the
     // brief `interrupting` window so a fast server response can't suppress it).
     // A single chunk above the adaptive threshold marks the user's onset.
+    // With manual VAD the SAME energy evaluation also runs in LISTENING
+    // phase (the first user utterance of a turn arrives there) and its
+    // sustained result drives the VAD window.
+    final manualVad = _manualVadActive;
+    bool speechHeld = false;
+    double speechRms = 0;
     if (_phase == SessionPhase.playing ||
         _phase == SessionPhase.responding ||
         _phase == SessionPhase.interrupting) {
@@ -535,21 +769,30 @@ class SiriousSessionController extends ChangeNotifier {
         _windowPeakRms = rms;
       }
 
-      // Update the quiet baseline only with near-silence samples.
-      if (rms < _onsetHardFloor * 2) {
+      // Near-silence floor update — MANUAL VAD: the ambient window is NOT
+      // fed during playback. The room level was measured in LISTENING and
+      // must stay frozen here: the answer's own residual (84–168 in loud
+      // rooms) sits below the admission bar and would ratchet the "ambient"
+      // up to itself, pushing the room term to 336+ (eats real barge-ins
+      // 255–305). Echo-level changes during playback are tracked by the
+      // residual term instead. Server-VAD paths keep the legacy update.
+      if (!manualVad && rms < _ambientAdmissionFloor * 2) {
         _recentRms.add(rms);
         if (_recentRms.length > _noiseWindowChunks) {
           _recentRms.removeAt(0);
         }
       }
-      var floor = double.infinity;
-      for (final v in _recentRms) {
-        if (v < floor) {
-          floor = v;
-        }
-      }
-      _onsetNoiseFloor = floor.isFinite ? floor : _onsetHardFloor;
+      _onsetNoiseFloor = _ambientFloor;
       latency.lastBargeInNoiseFloor = _onsetNoiseFloor;
+      // Step 4.5: feed the residual window (EVERY playback chunk — the p25
+      // absorbs bursts and near-silence tails) and refresh the measured
+      // residual that the adaptive playback onset clears.
+      _playbackResidualWindow.add(rms);
+      if (_playbackResidualWindow.length >
+          AdaptiveVadPolicy.residualWindowChunks) {
+        _playbackResidualWindow.removeAt(0);
+      }
+      _playbackResidual = AdaptiveVadPolicy.residual(_playbackResidualWindow);
 
       // Stage B (B3): while Sirious plays, the threshold must also clear the
       // residual echo floor at the current volume (measured post-AEC by the
@@ -557,14 +800,21 @@ class SiriousSessionController extends ChangeNotifier {
       // 266-521 RMS while real speech at speaker distance is 1000+). In
       // listening phase residual is 0 and the normal floor applies.
       final residual = _aecPipeline?.residualFloor ?? 0;
-      final hardFloor = _onsetPlaybackHardFloor;
-      final threshold = math.max(
-        math.max(
-          _onsetNoiseFloor * _onsetRiseFactor,
-          residual * _residualRiseFactor,
-        ),
-        hardFloor,
-      );
+      // Step 4.5 (manual VAD): ADAPTIVE playback onset — room term
+      // (ambient×4) + measured-residual term (p25×2), floored at 150.
+      // The fixed 450/150 floors were both room-calibrated by definition
+      // and failed on the opposite rooms (31 Aug). Server-VAD paths keep
+      // the legacy fixed-floor math.
+      final threshold = manualVad
+          ? _adaptiveOnset
+          : math.max(
+              math.max(
+                _onsetNoiseFloor * _onsetRiseFactor,
+                residual * _residualRiseFactor,
+              ),
+              _onsetPlaybackHardFloor,
+            );
+      _prevOnsetDecision = threshold;
 
       // Sustained-voice gate (Stage B, log-driven 30 Aug): post-AEC echo
       // arrives in TRANSIENTS — per-chunk RMS 3677-7033 while the residual
@@ -576,7 +826,9 @@ class SiriousSessionController extends ChangeNotifier {
       // First-burst echo now fails the gate; Gemini-side echoes never get
       // "voice evidence", and the burst itself still streams (harmless
       // residual noise for the server VAD, cleaned by the lexical filter).
-      final sustained = aec == null || !aec.farEndRecently || _wasLoud;
+      final prevLoud = _wasLoud;
+      final prevAboveHold = _prevChunkAboveHold;
+      final sustained = aec == null || !aec.farEndRecently || prevLoud;
       if (rms > threshold) {
         if (sustained) {
           if (latency.bargeInOnsetAt == null) {
@@ -585,7 +837,8 @@ class SiriousSessionController extends ChangeNotifier {
               _logToFile(
                 'ONSET route=$_activeRoute rms=${rms.toStringAsFixed(0)} '
                 'thr=${threshold.toStringAsFixed(0)} floor=${_onsetNoiseFloor.toStringAsFixed(0)} '
-                'res=${residual.toStringAsFixed(0)} sustained=true',
+                'res=${residual.toStringAsFixed(0)} '
+                'pres=${_playbackResidual.toStringAsFixed(0)} sustained=true',
               ),
             );
           }
@@ -601,7 +854,73 @@ class SiriousSessionController extends ChangeNotifier {
           );
         }
       }
-      _wasLoud = rms > threshold;
+      final nowLoud = rms > threshold;
+      _wasLoud = nowLoud;
+      _prevChunkAboveHold = rms > _vadHoldLevel;
+      // Manual VAD: playback windows open on SUSTAINED voice only — chunk 1
+      // above onset AND chunk 2 above hold (see _prevChunkAboveHold). The
+      // single-burst echo transient that killed answers in the 17:00 loop
+      // never gets a window now; the ONSET line still logs the crossing.
+      speechHeld = _manualVadActive
+          ? (nowLoud && prevAboveHold)
+          : nowLoud && sustained;
+      speechRms = rms;
+    }
+
+    // ── Step 4: manual client VAD (speaker route) ─────────────────────────
+    // In LISTENING the energy block above does not run; evaluate the same
+    // onset logic here so the first utterance of a turn opens the window.
+    // (Playback-phase chunks already evaluated speechHeld above.)
+    bool speech = speechHeld;
+    if (manualVad && _phase == SessionPhase.listening) {
+      final rms = _rms(chunk);
+      speechRms = rms;
+      // Adaptive floor in LISTENING (the playback-phase block above never
+      // ran here, so the floor stayed 0 — VAD_OPEN rms=… floor=0 in the
+      // 31 Aug 00:00 log). Same near-silence discipline, FIXED admission
+      // bar (speech-excluding; the adaptive floor itself must not decide
+      // admission — self-referential when speech is this quiet).
+      if (rms < _ambientAdmissionFloor * 2) {
+        _recentRms.add(rms);
+        if (_recentRms.length > _noiseWindowChunks) {
+          _recentRms.removeAt(0);
+        }
+        _onsetNoiseFloor = _ambientFloor;
+        latency.lastBargeInNoiseFloor = _onsetNoiseFloor;
+      }
+      // Step 4.5: adaptive onset, 80–150 band. The fixed 240 ate quiet
+      // speech (166–249 measured, 01:33 session — VAD_GATE while the user
+      // talked); the band's ceiling keeps breath/creak sounds (80–150 in
+      // quiet rooms) from being entirely free, and any real speech ≥166
+      // always crosses. Windows that open on non-speech close themselves
+      // within ~1 s (8 silent chunks) — bounded cost, sensitivity wins.
+      final threshold = _adaptiveOnset;
+      _prevOnsetDecision = threshold;
+      speech = rms > threshold;
+    }
+
+    if (manualVad) {
+      _vadTick(speech: speech, rms: speechRms);
+      if (speech && _vadOpenedAt == null) {
+        _vadOpen(speechRms);
+        // CLIENT-DRIVEN BARGE-IN: a sustained-voice window opening while
+        // Sirious talks IS the interruption — the server's `interrupted`
+        // only confirms it later (it can no longer invent one). Flush now:
+        // ~1 server round-trip faster than the old path, and immune to
+        // residue-driven phantoms.
+        if (_phase == SessionPhase.playing ||
+            _phase == SessionPhase.responding ||
+            _phase == SessionPhase.interrupting) {
+          unawaited(_handleInterruption(DateTime.now()));
+        }
+      }
+      // Stream gate: outside an open window NOTHING reaches the server —
+      // the residue (assistant-echo tails, ambient noise, our own residual)
+      // can no longer decide anything server-side. Inside the window audio
+      // flows normally (platform AEC has already removed the echo).
+      if (_vadOpenedAt == null) {
+        return;
+      }
     }
 
     if (_webSocketClient.isConnected) {
@@ -692,8 +1011,18 @@ class SiriousSessionController extends ChangeNotifier {
 
     // The onset window re-learns on the NEW capture path: stale noise-floor
     // samples from the old path (10x level difference) would deafen or
-    // saturate the threshold for up to the full 2s window.
+    // saturate the threshold for up to the full 2s window. Step 4.5: this
+    // must ALSO clear the adaptive windows — cross-turn persistence is only
+    // safe on the SAME capture path; a route restart changes the path.
     _endOnsetWindow();
+    _recentRms.clear();
+    _onsetNoiseFloor = 0;
+    _playbackResidualWindow.clear();
+    _playbackResidual = 0;
+    // Manual VAD: the window rides the capture path too — a route restart
+    // closes any open window on the old profile (its activityEnd still
+    // signals the server).
+    _vadClose(reason: 'route_restart');
 
     final line =
         'ROUTE #$_routeReinitCount: $oldRoute → $route — capture restarted '
@@ -707,6 +1036,7 @@ class SiriousSessionController extends ChangeNotifier {
 
   Future<void> _onJsonEvent(Map<String, dynamic> event) async {
     final type = event['type'] as String?;
+    final manualVad = _manualVadActive;
     debugPrint('WS_EVENT: $type');
     unawaited(_logToFile('EVENT $type ${event['text'] ?? ''}'));
 
@@ -715,6 +1045,10 @@ class SiriousSessionController extends ChangeNotifier {
         _sessionId = event['session_id'] as String?;
         latency.sessionConnectedAt = DateTime.now();
         final resumed = event['resumed'] == true;
+        final vadMode = event['vad_mode'] as String?;
+        if (vadMode != null) {
+          unawaited(_logToFile('VAD mode=$vadMode (client wanted $_manualVadActive)'));
+        }
         if (_phase == SessionPhase.reconnecting) {
           // Reconnect succeeded → resume listening on the fresh session.
           final recovered = _reconnectAttempts;
@@ -744,10 +1078,17 @@ class SiriousSessionController extends ChangeNotifier {
           break;
         }
 
+        // Step 4 (manual VAD): NO windowless-drop here. An earlier build
+        // dropped transcripts arriving with no open VAD window — wrong under
+        // manual VAD: the stream gate makes residue impossible, and the
+        // transcript legitimately arrives ~200-300 ms AFTER activity_end
+        // (server-side ASR finalizes after speech ends). Dropping it ate
+        // every user turn (31 Aug 01:09 report: "I don't see my turns").
+
         // Post-turn echo guard: the assistant's own tail can keep arriving
-        // through the AEC residual for a moment AFTER playback ends. A
-        // "user" transcript that repeats just-spoken assistant words within
-        // the guard window is echo — do not open a user turn with it.
+        // arriving through the AEC residual after playback ends; a "user"
+        // transcript repeating just-spoken assistant words within the guard
+        // window is echo — do not open a user turn with it.
         if (_phase == SessionPhase.listening &&
             _ghostDetector.isWithinPostTurnGuard &&
             _ghostDetector.isEcho(text)) {
@@ -823,6 +1164,22 @@ class SiriousSessionController extends ChangeNotifier {
         break;
 
       case 'interrupted':
+        // Step 4 (manual VAD): with automatic VAD off the server can no
+        // longer INVENT an interruption — `interrupted` means the model's
+        // generation was cancelled by OUR activityEnd (docs: an activityEnd
+        // marks the interruption). It is a CONFIRM of a client-initiated
+        // interruption, not a trigger; the flush already ran client-side
+        // when the window opened during playback. _handleInterruption is
+        // idempotent per turn (_interruptionHandled) and this handler keeps
+        // the legacy measurement path for non-manual modes.
+        if (manualVad) {
+          unawaited(
+            _logToFile(
+              'VAD_SERVER_INTERRUPTED route=$_activeRoute '
+              'windowOpen=${_vadOpenedAt != null} (client-driven confirm)',
+            ),
+          );
+        }
         await _handleInterruption(DateTime.now());
         break;
 
@@ -930,7 +1287,10 @@ class SiriousSessionController extends ChangeNotifier {
     try {
       // Same client_session_id → backend resumes the SAME Gemini session
       // (model memory intact) when it holds a live resumption handle.
-      await _webSocketClient.connect(clientSessionId: _clientSessionId);
+      await _webSocketClient.connect(
+        clientSessionId: _clientSessionId,
+        vadManual: _manualVadActive,
+      );
       // On success we stay in `reconnecting` until `session_started` flips us
       // to `listening`. If this attempt drops again, onDone schedules the next.
     } catch (error) {
@@ -998,12 +1358,23 @@ class SiriousSessionController extends ChangeNotifier {
   void _endOnsetWindow() {
     // Reset only the LIVE window tracking. Persisted display values
     // (lastBargeIn*) must survive so the summary keeps the last result.
-    _recentRms.clear();
-    _onsetNoiseFloor = 0;
+    // Step 4.5 (manual VAD): the AMBIENT window persists across turns —
+    // the room does not change between sentences, and wiping it reset the
+    // floor to 0 every turn (31 Aug loud-room failure: each answer started
+    // blind on the fixed 150 floor). A real room change re-learns within
+    // the 2 s window (speech-excluding admission). The measured playback
+    // residual persists too — it seeds the next answer's adaptive floor.
+    // Server-VAD paths keep the legacy full reset.
+    if (!_manualVadActive) {
+      _recentRms.clear();
+      _onsetNoiseFloor = 0;
+    }
     _windowPeakRms = 0;
     _lastVoiceLikeAt = null; // ghost gate: stale voice evidence must not count
     _wasLoud = false; // sustain gate: a stale "was loud" must not carry over
+    _prevChunkAboveHold = false; // step 4.6: same discipline for the open gate
     _interruptionHandled = false;
+    _prevOnsetDecision = AdaptiveVadPolicy.playbackLowerClamp;
     // Adaptive duck (Stage B ghost-gate fallback): restore the caller's base
     // state — a ghost-triggered per-turn duck never survives the turn boundary.
     _captureDucked = _captureDuckedBase;

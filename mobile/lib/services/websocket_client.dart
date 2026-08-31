@@ -42,6 +42,7 @@ class WebSocketClient {
     String? clientSessionId,
     String? seed,
     String? invoke,
+    bool vadManual = false,
   }) async {
     await disconnect();
 
@@ -61,6 +62,9 @@ class WebSocketClient {
     }
     if (invoke != null && invoke.isNotEmpty) {
       query['invoke'] = invoke;
+    }
+    if (vadManual) {
+      query['vad'] = 'manual';
     }
 
     // Phase 2 auth: server rejects the handshake without ?token=...
@@ -115,6 +119,18 @@ class WebSocketClient {
 
   void sendAudio(Uint8List pcm) {
     _channel?.sink.add(pcm);
+  }
+
+  /// Manual-VAD activity signals (Phase 6 step 4). Text control frames the
+  /// backend relays to Gemini as send_realtime_input(activity_start/end).
+  /// No-ops when the socket is down — the controller treats a failed signal
+  /// exactly like audio loss (VAD window closes on its end-of-speech timer).
+  void sendActivityStart() {
+    _channel?.sink.add('activity_start');
+  }
+
+  void sendActivityEnd() {
+    _channel?.sink.add('activity_end');
   }
 
   void sendStop() {
