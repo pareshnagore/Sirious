@@ -98,3 +98,27 @@ are cheap and may make step 4 an upgrade instead of a rescue.
   adb-pulled logs + server /sessions dumps before flashing (never partial
   screenshots), Paresh never needs to barge-in manually for tests (app
   self-barges = the bug signature).
+
+## STEP 6 SHIPPED (6 Sep 2026): hybrid rescue-net live (commit 51b171228, rev 00053)
+
+The word-eating fix landed as `?vad=hybrid` on the speaker route:
+- **Backend**: `vad=hybrid` = Gemini automaticActivityDetection ENABLED at
+  START/END_SENSITIVITY_LOW (the same default we ran for weeks pre-step-4,
+  which never ghosted during listening). Relay guard stays manual-only —
+  hybrid sends NO activity signals (SDK mutual exclusion, S2 1007 class).
+- **Client**: window machinery stays LOCAL. During PLAYBACK the stream gate
+  is unchanged — echo can never reach Gemini (ghost class dead by
+  construction). During LISTENING the stream UN-gates once the playback
+  tail clears (`_lastPlaybackChunkAt`, 400 ms > observed ~200 ms first-echo
+  transient). Client barge-in flush unchanged (13–52 ms). Earphone route
+  byte-identical (server VAD).
+- **Proven**: S2 relay-path prod smoke PASS (3b9025b1d, guard suppresses the
+  31 Aug violation class); handshake probe hybrid/manual/server all OK
+  through the real Gemini bridge (local + prod rev 00053); backend 146
+  tests; flutter analyze 0; flutter test 49/49.
+- **Device validation anchors**: fewer VAD_GATE/ONSET_MISSING lines, first
+  words transcribing (no foreign-word fragments), zero ghost/self-interrupt
+  turns, barge-in 13–52 ms unchanged, earphone unchanged. Known cosmetic
+  bug: stale `BARGE_IN ok onset_ms=4xxx` metrics (onset timestamp reused).
+- **Escape dial**: if Gemini LOW still misses quiet onsets, flip
+  START_SENSITIVITY_LOW→HIGH in main.py (one line, scoped to hybrid).
