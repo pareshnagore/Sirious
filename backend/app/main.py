@@ -1040,7 +1040,7 @@ async def websocket_endpoint(
                                 types.AutomaticActivityDetection(
                                     disabled=False,
                                     start_of_speech_sensitivity=(
-                                        types.StartSensitivity.START_SENSITIVITY_LOW
+                                        types.StartSensitivity.START_SENSITIVITY_HIGH
                                     ),
                                     end_of_speech_sensitivity=(
                                         types.EndSensitivity.END_SENSITIVITY_LOW
