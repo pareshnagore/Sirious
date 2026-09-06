@@ -42,7 +42,7 @@ class WebSocketClient {
     String? clientSessionId,
     String? seed,
     String? invoke,
-    bool vadManual = false,
+    bool vadHybrid = false,
   }) async {
     await disconnect();
 
@@ -63,8 +63,8 @@ class WebSocketClient {
     if (invoke != null && invoke.isNotEmpty) {
       query['invoke'] = invoke;
     }
-    if (vadManual) {
-      query['vad'] = 'manual';
+    if (vadHybrid) {
+      query['vad'] = 'hybrid';
     }
 
     // Phase 2 auth: server rejects the handshake without ?token=...
@@ -125,6 +125,9 @@ class WebSocketClient {
   /// backend relays to Gemini as send_realtime_input(activity_start/end).
   /// No-ops when the socket is down — the controller treats a failed signal
   /// exactly like audio loss (VAD window closes on its end-of-speech timer).
+  /// Phase 6 step 6 (hybrid): these are NOT sent on the hybrid path (SDK
+  /// forbids activity signals with auto-detection enabled); the backend
+  /// silently swallows them there — kept for the manual-VAD contract.
   void sendActivityStart() {
     _channel?.sink.add('activity_start');
   }

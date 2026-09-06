@@ -686,7 +686,8 @@ async def websocket_endpoint(
     # path unchanged).
     vad_mode = _clean_query_text(websocket.query_params.get("vad"), 20)
     manual_vad = vad_mode == "manual"
-    if vad_mode and vad_mode != "manual":
+    hybrid_vad = vad_mode == "hybrid"
+    if vad_mode and not (manual_vad or hybrid_vad):
         log_event(session_id, "vad_param_unknown", value=vad_mode)
     ambient_block = _ambient_seed_block(seed)
     if invoke:
@@ -727,7 +728,10 @@ async def websocket_endpoint(
     last_resumption_handle: str | None = resume_handle
     # Relay guard: collapses duplicate/unbalanced activity signals before
     # they reach Gemini's state machine (the S2 1007 precondition class).
-    # Only used when the client owns turn boundaries (vad=manual).
+    # Only used when the client owns turn boundaries (vad=manual). The
+    # hybrid mode (vad=hybrid) keeps Gemini's automatic detection — the
+    # client sends NO activity signals there (SDK mutual exclusion), so
+    # there is nothing to guard.
     activity_guard = ActivityWindowGuard() if manual_vad else None
 
     # Persistence (Phase 2): one Firestore doc per LOGICAL conversation —
@@ -1021,6 +1025,33 @@ async def websocket_endpoint(
                     if manual_vad
                     else {}
                 ),
+                # Phase 6 step 6 (hybrid rescue-net, vad=hybrid): Gemini's
+                # automatic activity detection stays ENABLED at LOW/LOW (the
+                # API default we ran pre-step-4) — it rescues speech the
+                # client energy gate misses. The client keeps its window
+                # machinery LOCALLY for barge-in gating and does NOT send
+                # activity signals (SDK forbids them with auto-detection
+                # enabled — the S2 1007 precondition class). Echo stays
+                # dead by the client's playback stream gate, not by VAD.
+                **(
+                    {
+                        "realtime_input_config": types.RealtimeInputConfig(
+                            automatic_activity_detection=(
+                                types.AutomaticActivityDetection(
+                                    disabled=False,
+                                    start_of_speech_sensitivity=(
+                                        types.StartSensitivity.START_SENSITIVITY_LOW
+                                    ),
+                                    end_of_speech_sensitivity=(
+                                        types.EndSensitivity.END_SENSITIVITY_LOW
+                                    ),
+                                )
+                            ),
+                        ),
+                    }
+                    if hybrid_vad
+                    else {}
+                ),
             ),
         ) as session:
 
@@ -1028,7 +1059,8 @@ async def websocket_endpoint(
                 "type": "session_started",
                 "session_id": session_id,
                 "resumed": resumed,
-                "vad_mode": "manual" if manual_vad else "server",
+                "vad_mode": "manual" if manual_vad
+                else ("hybrid" if hybrid_vad else "server"),
             })
 
             # C2 invocation: the room transcript already contains the user's

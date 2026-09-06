@@ -138,8 +138,7 @@ class SiriousSessionController extends ChangeNotifier {
   /// ([_adaptiveOnset] — room term + measured-residual term, 80–150 band);
   /// this getter is now only the FIXED speech-exclusion floor (route-based,
   /// post-gain) used for window admission and the legacy server-VAD paths.
-  double get _onsetHardFloor =>
-      CaptureRoutePolicy.onsetHardFloor(_activeRoute);
+  double get _onsetHardFloor => CaptureRoutePolicy.onsetHardFloor(_activeRoute);
 
   /// Live ambient estimate for threshold math (source of truth is the
   /// near-silence window; [_onsetNoiseFloor] is its logging mirror).
@@ -251,10 +250,43 @@ class SiriousSessionController extends ChangeNotifier {
       !_useSoftwareAec &&
       !_captureDucked;
 
+  /// Phase 6 step 6 (hybrid rescue-net): on the speaker route the client
+  /// requests ?vad=hybrid — Gemini's automatic detection stays ON at LOW/LOW
+  /// and rescues speech the local energy gate misses. The window machinery
+  /// below stays LOCAL-ONLY in this mode: it gates the stream during
+  /// playback (echo can never reach Gemini) and drives the client barge-in
+  /// flush, but no activity signals are sent (SDK mutual exclusion).
+  bool get _hybridVadActive => _manualVadActive;
+
   /// The single OPEN VAD window. null = closed = stream gated.
   DateTime? _vadOpenedAt;
   int _vadSpeechChunks = 0;
   int _vadSilenceChunks = 0;
+
+  // ── Phase 6 step 6: hybrid rescue-net playback-tail tracking ──────────
+  // Wall-clock of the last chunk fed to the SPEAKER. The rescue stream
+  // (un-gated listening) waits for this tail to clear (~400 ms of quiet)
+  // so the tail of our own answer — not yet through AEC as residue —
+  // cannot leak to Gemini. 400 ms > the ~200 ms observed first-echo
+  // transient latency with margin.
+  DateTime? _lastPlaybackChunkAt;
+  static const Duration _playbackTailClear = Duration(milliseconds: 400);
+  bool get _playbackTailCleared {
+    final last = _lastPlaybackChunkAt;
+    if (last == null) {
+      return true;
+    }
+    return DateTime.now().difference(last) >= _playbackTailClear;
+  }
+
+  /// Rescue stream active: hybrid mode + LISTENING + playback tail cleared.
+  /// While true the mic streams UN-gated so Gemini LOW VAD hears everything
+  /// (rescuing quiet onsets the client gate misses). Never true during
+  /// playback — echo can never reach Gemini.
+  bool get _rescueStreamActive =>
+      _hybridVadActive &&
+      _phase == SessionPhase.listening &&
+      _playbackTailCleared;
 
   /// Consecutive gated (no-window) chunks — diagnostics for the one real
   /// manual-VAD failure mode: a threshold so high the gate eats real speech.
@@ -355,6 +387,7 @@ class SiriousSessionController extends ChangeNotifier {
       }
     }
   }
+
   // AEC residual at conversational volume stays intelligible enough that
   // Gemini transcribes the assistant's OWN words back as user turns (seen
   // live 29 Aug: "What can I help", "Just let me know" as You-turns). Energy
@@ -604,7 +637,8 @@ class SiriousSessionController extends ChangeNotifier {
       await AudioRouteWatcher.instance.detectRoute(),
     );
     final routeProfile = duckCapture
-        ? CaptureProfile.nearTalk // ambient C2: capture ducked during playback
+        ? CaptureProfile
+              .nearTalk // ambient C2: capture ducked during playback
         : CaptureRoutePolicy.profileForRoute(_activeRoute);
     unawaited(
       _logToFile(
@@ -632,15 +666,14 @@ class SiriousSessionController extends ChangeNotifier {
 
     try {
       await _audioPlayback.init();
+      _lastPlaybackChunkAt = null;
       await _webSocketClient.connect(
         clientSessionId: _clientSessionId,
         seed: seed,
         invoke: invoke,
-        vadManual: _manualVadActive,
+        vadHybrid: _hybridVadActive,
       );
-      await _audioCapture.start(
-        profile: routeProfile,
-      );
+      await _audioCapture.start(profile: routeProfile);
       _startKeepalive();
       _setPhase(SessionPhase.listening);
     } catch (error) {
@@ -664,6 +697,7 @@ class SiriousSessionController extends ChangeNotifier {
     _allowReconnect = false;
     _captureDucked = false;
     _vadClose(reason: 'session_end');
+    _lastPlaybackChunkAt = null;
     _levelStampDone = false;
     _levelSumSq = 0;
     _levelChunks = 0;
@@ -914,11 +948,13 @@ class SiriousSessionController extends ChangeNotifier {
           unawaited(_handleInterruption(DateTime.now()));
         }
       }
-      // Stream gate: outside an open window NOTHING reaches the server —
-      // the residue (assistant-echo tails, ambient noise, our own residual)
-      // can no longer decide anything server-side. Inside the window audio
-      // flows normally (platform AEC has already removed the echo).
-      if (_vadOpenedAt == null) {
+      // Stream gate (hybrid): during PLAYBACK an open window is still the
+      // ONLY way audio reaches the server — our own echo can never reach
+      // Gemini (ghosts stay dead by construction). During LISTENING, once
+      // the playback tail has cleared, the stream is deliberately UN-gated
+      // (rescue): Gemini's LOW automatic VAD hears everything the local
+      // energy gate missed, at the cost of ~200 ms slower turn-start.
+      if (_vadOpenedAt == null && !_rescueStreamActive) {
         return;
       }
     }
@@ -936,6 +972,9 @@ class SiriousSessionController extends ChangeNotifier {
     }
 
     _audioPlayback.enqueue(chunk);
+    // Hybrid rescue-net: stamp the far-end tail so the un-gated listening
+    // stream waits ~400 ms past the LAST speaker-fed chunk before opening.
+    _lastPlaybackChunkAt = DateTime.now();
   }
 
   /// Wire the AEC far-end reference to the playback drain loop (pre-feed).
@@ -956,9 +995,7 @@ class SiriousSessionController extends ChangeNotifier {
       await AudioRouteWatcher.instance.detectRoute(),
     );
     if (route == _activeRoute) {
-      unawaited(
-        _logToFile('ROUTE event → same class ($_activeRoute) — no-op'),
-      );
+      unawaited(_logToFile('ROUTE event → same class ($_activeRoute) — no-op'));
       return;
     }
     if (!_phase.isActive) {
@@ -1047,7 +1084,18 @@ class SiriousSessionController extends ChangeNotifier {
         final resumed = event['resumed'] == true;
         final vadMode = event['vad_mode'] as String?;
         if (vadMode != null) {
-          unawaited(_logToFile('VAD mode=$vadMode (client wanted $_manualVadActive)'));
+          unawaited(
+            _logToFile(
+              'VAD mode=$vadMode (client wanted hybrid=$_hybridVadActive manual=$_manualVadActive)',
+            ),
+          );
+          if (vadMode == 'hybrid') {
+            unawaited(
+              _logToFile(
+                'HYBRID_VAD rescue-stream on listening (tail ${_playbackTailClear.inMilliseconds}ms)',
+              ),
+            );
+          }
         }
         if (_phase == SessionPhase.reconnecting) {
           // Reconnect succeeded → resume listening on the fresh session.
@@ -1289,7 +1337,7 @@ class SiriousSessionController extends ChangeNotifier {
       // (model memory intact) when it holds a live resumption handle.
       await _webSocketClient.connect(
         clientSessionId: _clientSessionId,
-        vadManual: _manualVadActive,
+        vadHybrid: _hybridVadActive,
       );
       // On success we stay in `reconnecting` until `session_started` flips us
       // to `listening`. If this attempt drops again, onDone schedules the next.
