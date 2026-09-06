@@ -959,6 +959,19 @@ class SiriousSessionController extends ChangeNotifier {
       }
     }
 
+    // Echo hard-block (6 Sep 22:45 lesson): during PLAYBACK the client
+    // streams NOTHING in hybrid mode. Residual-echo windows streamed the
+    // answer's tail to Gemini's auto-VAD (it answered its own voice).
+    // The client flush already cut the answer; the user's speech reaches
+    // Gemini via the rescue stream once the tail clears. Missed words in
+    // the ~1 s gap are acceptable — echo loops never are.
+    if (_hybridVadActive &&
+        (_phase == SessionPhase.playing ||
+            _phase == SessionPhase.responding ||
+            _phase == SessionPhase.interrupting)) {
+      return;
+    }
+
     if (_webSocketClient.isConnected) {
       _webSocketClient.sendAudio(chunk);
     }
@@ -972,15 +985,24 @@ class SiriousSessionController extends ChangeNotifier {
     }
 
     _audioPlayback.enqueue(chunk);
-    // Hybrid rescue-net: stamp the far-end tail so the un-gated listening
-    // stream waits ~400 ms past the LAST speaker-fed chunk before opening.
-    _lastPlaybackChunkAt = DateTime.now();
+    // Hybrid rescue-net: stamp at the PLAYBACK TAP (pre-feed to the native
+    // track), NOT here at enqueue — the queue holds 0.5-2s of buffered
+    // audio, so an enqueue-time stamp opens the rescue stream while the
+    // speaker is still playing the answer tail (echo reached Gemini this
+    // way on the 6 Sep 22:45 device test). The tap stamps _lastPlaybackChunkAt.
   }
 
   /// Wire the AEC far-end reference to the playback drain loop (pre-feed).
   /// Called once after the pipeline is created.
   void _connectAecTap() {
-    _audioPlayback.playbackTap = (chunk) => _aecPipeline?.feedRender(chunk);
+    _audioPlayback.playbackTap = (chunk) {
+      _aecPipeline?.feedRender(chunk);
+      // Hybrid rescue-net: stamp the tail AT PLAYOUT — the last chunk fed
+      // to the native speaker track. The un-gated rescue stream waits
+      // 400 ms past THIS stamp, so it cannot open while audio is still
+      // buffered/playing (enqueue-time stamping was the 6 Sep echo leak).
+      _lastPlaybackChunkAt = DateTime.now();
+    };
   }
 
   /// Stage C (1): the audio output route changed → re-classify and, on a
