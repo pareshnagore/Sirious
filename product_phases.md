@@ -1,6 +1,6 @@
 # Sirious — Product Phases
 
-**Date:** 16 August 2026 · **Last updated:** 28 Aug 2026 — goal pivot: Phase 5 parked, Phase 6 (single-user speaker mode) active.  
+**Date:** 16 August 2026 · **Last updated:** 7 Sep 2026 — Phase 6 step 6 (hybrid rescue-net) shipped on-device; HIGH-sensitivity trial pending. 
 **Purpose:** Map the long-term Sirious vision to incremental, shippable phases. Use this to avoid scope creep and to decide what belongs in the current milestone vs later work.
 
 ---
@@ -51,7 +51,7 @@ Product phases span multiple layers. A single product phase may complete parts o
 
 **Current status**
 
-**Phase 4 (tools & actions) is complete — reminders E2E on device, Phase 4 closed 24 Aug 2026. GOAL PIVOT 28 Aug 2026: Phase 5 (ambient multi-speaker) PARKED after the office trial — Deepgram laggy, dropped sentences; active goal is now Phase 6 — single-user speaker mode.**
+**Phase 4 (tools & actions) is complete — reminders E2E on device, Phase 4 closed 24 Aug 2026. GOAL PIVOT 28 Aug 2026: Phase 5 (ambient multi-speaker) PARKED after the office trial — Deepgram laggy, dropped sentences; active goal is now Phase 6 — single-user speaker mode.** STATUS 7 Sep 2026: step 6 hybrid rescue-net SHIPPED (vad=hybrid: Gemini auto-VAD at HIGH start/LOW end + client zero-stream during playback + rescue stream in listening; echo structurally dead, commits 51b171228/1a87d36a0/47cae8ab3, prod rev 00054). Pending: two HIGH trials (T1 quiet+fan, T2 daily conversation) → keep HIGH or roll back to LOW (1-line backend flip). Known residual: rare client-flush false cuts on loud answers (Option B double-talk detection parked); instrumentation/logging hygiene parked (see docs/phase6_speaker_checkpoint.md "6-7 Sep" section for the full list).
 
 ```text
 ✅ Cloud Run WebSocket bridge

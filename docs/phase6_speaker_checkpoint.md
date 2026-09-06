@@ -122,3 +122,46 @@ The word-eating fix landed as `?vad=hybrid` on the speaker route:
   bug: stale `BARGE_IN ok onset_ms=4xxx` metrics (onset timestamp reused).
 - **Escape dial**: if Gemini LOW still misses quiet onsets, flip
   START_SENSITIVITY_LOW→HIGH in main.py (one line, scoped to hybrid).
+
+### 6-7 Sep device results + decisions (session close, 7 Sep)
+
+- **22:45 test (loud room): echo leak found + FIXED** (commit 1a87d36a0,
+  APK reflashed). Gemini transcribed the answer tail as user turns ("the
+  Russian emperor"). Root cause: two client leaks — tail stamped at
+  ENQUEUE (queue holds 0.5-2s → rescue window opened during playback) and
+  playback windows streaming residual echo. Fixes: stamp at the playout
+  tap (where AEC render reference is fed) + ZERO-STREAM hard-block during
+  playing/responding/interrupting → Gemini hears no mic audio during
+  answers; phantom turns structurally impossible. Cost: user's first word
+  at an interruption may fall in the ~1s gap (accepted).
+- **23:35 normal voice: clean** (leak fixes held, zero ghosts).
+  **23:40 quiet voice: 11+ VAD_GATE, LOW rescued none** (onsets 157-200
+  vs adaptive thr up to 181) → **escape dial FIRED**: START_SENSITIVITY
+  LOW→HIGH (commit 47cae8ab3, prod rev 00054, handshake re-verified).
+  END stays LOW (word-tail protection).
+- **00:08 HIGH test: 3 false cuts** ('several hundred' ×2 — model re-said
+  the same sentence — and 'particular sport') = CLIENT flush firing on
+  echo transients (170-270 RMS vs adaptive thr 150-174) during loud
+  answers. No loop (hard-block held), no reconnects, clean end. Known
+  design limit: p25 residual cannot anticipate transients.
+- **DECISIONS (user):** no flush delay (taxes every barge-in ~50→300ms for
+  a rare bounded annoyance); Option B (echo-aware double-talk detection —
+  what vendor apps do) PARKED for if cuts get frequent in daily use;
+  removing the client flush is off the table (it is the only barge-in
+  path under zero-stream).
+- **PENDING: two HIGH trials** — T1 quiet voice + fan (pass = first words
+  intact AND no phantom turns; any fail → rollback HIGH→LOW, one line,
+  no APK rebuild); T2 normal daily conversation (count false cuts; cuts
+  are the FLUSH issue, not VAD — must not drive the rollback decision).
+  Fan was ON in every 6-7 Sep test: zero noise-phantoms so far.
+- **PARKED (instrumentation/logging):** single-clock log lines (the
+  IST+UTC mix cost ~30 min of session mix-up), per-session log file or
+  delimited section, session tag on client log lines (server EVENT lines
+  carry session_id; client lines do not), build stamp at session start
+  (proving which APK ran a test required pulling the device APK),
+  analyzer script (device log + Firestore turns → per-session summary:
+  turns/cuts/gates/ghosts/latency). Skills research verdict:
+  anthropics/skills has no observability skill; dash0hq/agent-skills OTel
+  concepts-yes/stack-no (backend overkill + voice-data privacy surface);
+  method = load systematic-debugging at the START of every log
+  investigation; author own sirious-logging skill. OTel/Sentry rejected.
